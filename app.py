@@ -2,46 +2,92 @@ import os
 import json
 import logging
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
+from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Dict, Any
 import google.generativeai as genai
 from google.cloud import storage
-from google.oauth2 import service_account
 import PyPDF2
 from io import BytesIO
 import traceback
-import yaml
 import uuid
-import threading
 from werkzeug.utils import secure_filename
 import re
+
+# Import Pydantic models
+from models import AnalysisRequest, PipelineRequest, AnalysisResult
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+app = FastAPI(
+    title="ATOMS Requirements Analysis API",
+    description="""
+## Overview
+Professional API for analyzing software requirements against INCOSE/EARS standards and regulatory compliance.
+
+### Key Features
+- **INCOSE/EARS Standards Compliance**: Automatically analyze and rewrite requirements following industry standards
+- **Regulatory Compliance**: Check requirements against uploaded regulation documents
+- **Organization-based Document Management**: Secure, isolated document storage per organization
+- **AI-Powered Analysis**: Three-step analysis pipeline using Google's Gemini AI
+- **Asynchronous Processing**: Support for both sync and async analysis workflows
+
+### Authentication
+This API uses Google Cloud Identity tokens for authentication. All users must be part of the authorized domain.
+
+### Usage
+1. Upload regulation documents to your organization
+2. Submit requirements for analysis
+3. Receive enhanced, compliant requirements with detailed feedback
+
+Built with FastAPI and deployed on Google Cloud Run.
+    """,
+    version="2.0.0",
+    contact={
+        "name": "ATOMS Engineering Team",
+        "email": "support@atoms.tech",
+    },
+    license_info={
+        "name": "Proprietary",
+        "url": "https://atoms.tech/license",
+    },
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Initialize Google AI
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+if os.getenv('GEMINI_API_KEY'):
+    genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
 # Initialize Google Cloud Storage client
 storage_client = storage.Client()
 
 # In-memory job storage (in production, use Redis or database)
-job_storage = {}
+job_storage: Dict[str, Dict[str, Any]] = {}
 
-def get_organization_bucket_name(organization_id):
+# --- Helper Functions ---
+
+def get_organization_bucket_name(organization_id: str) -> str:
     """Get bucket name for organization."""
     return f"{organization_id}-requirements"
 
-def create_bucket_if_not_exists(bucket_name):
+def create_bucket_if_not_exists(bucket_name: str) -> storage.Bucket:
     """Create bucket if it doesn't exist."""
     try:
         bucket = storage_client.bucket(bucket_name)
         if not bucket.exists():
-            # Create bucket in the same region as the service
             bucket = storage_client.create_bucket(bucket_name, location="US")
             logger.info(f"Created bucket: {bucket_name}")
         return bucket
@@ -49,17 +95,13 @@ def create_bucket_if_not_exists(bucket_name):
         logger.error(f"Error creating bucket {bucket_name}: {str(e)}")
         raise
 
-def get_versioned_filename(bucket, base_filename):
+def get_versioned_filename(bucket: storage.Bucket, base_filename: str) -> str:
     """Get a versioned filename if the base filename already exists."""
-    # Extract name and extension
     name, ext = os.path.splitext(base_filename)
-    
-    # Check if base filename exists
     blob = bucket.blob(base_filename)
     if not blob.exists():
         return base_filename
     
-    # Find the next available version
     counter = 1
     while True:
         versioned_name = f"{name}({counter}){ext}"
@@ -68,7 +110,7 @@ def get_versioned_filename(bucket, base_filename):
             return versioned_name
         counter += 1
 
-def list_organization_documents(organization_id):
+async def list_organization_documents(organization_id: str) -> List[Dict[str, Any]]:
     """List all documents in an organization's bucket."""
     try:
         bucket_name = get_organization_bucket_name(organization_id)
@@ -85,13 +127,12 @@ def list_organization_documents(organization_id):
                 "created": blob.time_created.isoformat() if blob.time_created else None,
                 "updated": blob.updated.isoformat() if blob.updated else None
             })
-        
         return documents
     except Exception as e:
         logger.error(f"Error listing documents for organization {organization_id}: {str(e)}")
-        raise
+        raise HTTPException(status_code=500, detail=f"Failed to list documents: {str(e)}")
 
-def delete_organization_document(organization_id, document_name):
+async def delete_organization_document(organization_id: str, document_name: str) -> bool:
     """Delete a document from an organization's bucket."""
     try:
         bucket_name = get_organization_bucket_name(organization_id)
@@ -107,11 +148,13 @@ def delete_organization_document(organization_id, document_name):
         blob.delete()
         logger.info(f"Deleted document {document_name} from organization {organization_id}")
         return True
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Error deleting document {document_name} for organization {organization_id}: {str(e)}")
-        raise
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {str(e)}")
 
-def extract_text_from_pdf(pdf_content):
+def extract_text_from_pdf(pdf_content: bytes) -> str:
     """Extract text from PDF bytes."""
     try:
         pdf_reader = PyPDF2.PdfReader(BytesIO(pdf_content))
@@ -123,7 +166,7 @@ def extract_text_from_pdf(pdf_content):
         logger.error(f"Error extracting PDF text: {str(e)}")
         return ""
 
-def get_regulation_document(document_name, organization_id):
+async def get_regulation_document(document_name: str, organization_id: str) -> str:
     """Download and extract text from regulation document in organization's bucket."""
     try:
         bucket_name = get_organization_bucket_name(organization_id)
@@ -132,14 +175,11 @@ def get_regulation_document(document_name, organization_id):
         if not bucket.exists():
             raise FileNotFoundError(f"Organization bucket not found: {bucket_name}")
         
-        # Try different possible file extensions
         possible_extensions = ['.pdf', '.PDF']
-        
         for ext in possible_extensions:
             try:
                 blob_name = f"{document_name}{ext}" if not document_name.endswith(ext) else document_name
                 blob = bucket.blob(blob_name)
-                
                 if blob.exists():
                     pdf_content = blob.download_as_bytes()
                     return extract_text_from_pdf(pdf_content)
@@ -148,18 +188,16 @@ def get_regulation_document(document_name, organization_id):
                 continue
         
         raise FileNotFoundError(f"Document {document_name} not found in bucket {bucket_name}")
-        
     except Exception as e:
         logger.error(f"Error getting regulation document: {str(e)}")
         raise
 
-def upload_file_to_organization_bucket(file_content, filename, organization_id):
+async def upload_file_to_organization_bucket(file_content: bytes, filename: str, organization_id: str) -> str:
     """Upload file to organization's Cloud Storage bucket."""
     try:
         bucket_name = get_organization_bucket_name(organization_id)
         bucket = create_bucket_if_not_exists(bucket_name)
         
-        # Get versioned filename to handle duplicates
         secure_name = secure_filename(filename)
         final_filename = get_versioned_filename(bucket, secure_name)
         
@@ -172,9 +210,8 @@ def upload_file_to_organization_bucket(file_content, filename, organization_id):
         logger.error(f"Error uploading file: {str(e)}")
         raise
 
-def analyze_requirement_step1(original_requirement, system_name="", objective="", req_id="", temperature=0.1):
+async def analyze_requirement_step1(original_requirement: str, system_name: str = "", objective: str = "", req_id: str = "", temperature: float = 0.1) -> Dict:
     """Step 1: Initial Requirements Analysis using INCOSE and EARS standards."""
-    
     prompt = f"""
     As a requirements engineering expert, analyze the following requirement against INCOSE and EARS (Easy Approach to Requirements Syntax) standards.
 
@@ -215,30 +252,20 @@ def analyze_requirement_step1(original_requirement, system_name="", objective=""
         "analysis_timestamp": "{datetime.now().isoformat()}"
     }}
     """
-    
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        response = model.generate_content(
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = await model.generate_content_async(
             prompt,
             generation_config=genai.types.GenerationConfig(temperature=temperature)
         )
-        
-        # Extract JSON from response
-        response_text = response.text.strip()
-        if response_text.startswith('```json'):
-            response_text = response_text[7:-3].strip()
-        elif response_text.startswith('```'):
-            response_text = response_text[3:-3].strip()
-            
+        response_text = response.text.strip().replace("```json", "").replace("```", "")
         return json.loads(response_text)
-        
     except Exception as e:
         logger.error(f"Error in Step 1 analysis: {str(e)}")
         raise
 
-def analyze_regulation_step2(requirement_analysis, regulation_text, regulation_doc_name, temperature=0.1):
+async def analyze_regulation_step2(requirement_analysis: Dict, regulation_text: str, regulation_doc_name: str, temperature: float = 0.1) -> Dict:
     """Step 2: Regulatory Research and Compliance Analysis."""
-    
     prompt = f"""
     As a regulatory compliance expert, analyze the following requirement against the provided regulation document.
 
@@ -270,30 +297,20 @@ def analyze_regulation_step2(requirement_analysis, regulation_text, regulation_d
         "analysis_timestamp": "{datetime.now().isoformat()}"
     }}
     """
-    
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        response = model.generate_content(
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = await model.generate_content_async(
             prompt,
             generation_config=genai.types.GenerationConfig(temperature=temperature)
         )
-        
-        # Extract JSON from response
-        response_text = response.text.strip()
-        if response_text.startswith('```json'):
-            response_text = response_text[7:-3].strip()
-        elif response_text.startswith('```'):
-            response_text = response_text[3:-3].strip()
-            
+        response_text = response.text.strip().replace("```json", "").replace("```", "")
         return json.loads(response_text)
-        
     except Exception as e:
         logger.error(f"Error in Step 2 analysis: {str(e)}")
         raise
 
-def analyze_compliance_step3(requirement_analysis, regulation_analysis, temperature=0.1):
+async def analyze_compliance_step3(requirement_analysis: Dict, regulation_analysis: Dict, temperature: float = 0.1) -> Dict:
     """Step 3: Compliance Integration and Enhanced Requirements."""
-    
     prompt = f"""
     As a systems engineering expert, integrate the requirement analysis with regulatory findings to produce enhanced, compliant requirements.
 
@@ -324,73 +341,51 @@ def analyze_compliance_step3(requirement_analysis, regulation_analysis, temperat
         "analysis_timestamp": "{datetime.now().isoformat()}"
     }}
     """
-    
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        response = model.generate_content(
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = await model.generate_content_async(
             prompt,
             generation_config=genai.types.GenerationConfig(temperature=temperature)
         )
-        
-        # Extract JSON from response
-        response_text = response.text.strip()
-        if response_text.startswith('```json'):
-            response_text = response_text[7:-3].strip()
-        elif response_text.startswith('```'):
-            response_text = response_text[3:-3].strip()
-            
+        response_text = response.text.strip().replace("```json", "").replace("```", "")
         return json.loads(response_text)
-        
     except Exception as e:
         logger.error(f"Error in Step 3 analysis: {str(e)}")
         raise
 
-def run_analysis_job(job_id, analysis_params):
-    """Run the analysis job in background thread."""
+async def run_analysis_job(job_id: str, analysis_params: Dict):
+    """Run the analysis job in background."""
     try:
         logger.info(f"Starting analysis job {job_id}")
         job_storage[job_id]['state'] = 'RUNNING'
         
-        # Extract parameters
-        original_requirement = analysis_params['original_requirement']
-        regulation_document_name = analysis_params['regulation_document_name']
-        organization_id = analysis_params['organization_id']
-        system_name = analysis_params.get('system_name', '')
-        objective = analysis_params.get('objective', '')
-        req_id = analysis_params.get('req_id', '')
-        temperature = analysis_params.get('temperature', 0.1)
-        
-        # Step 1: Initial Requirements Analysis
-        logger.info(f"Job {job_id}: Step 1 - Analyzing requirement against INCOSE/EARS standards")
-        analysis_json = analyze_requirement_step1(
-            original_requirement, system_name, objective, req_id, temperature
+        req = AnalysisRequest(**analysis_params)
+
+        # Step 1
+        analysis_json = await analyze_requirement_step1(
+            req.original_requirement, req.system_name, req.objective, req.req_id, req.temperature
         )
         
-        # Step 2: Regulatory Research
-        logger.info(f"Job {job_id}: Step 2 - Analyzing regulatory compliance")
+        # Step 2
         try:
-            regulation_text = get_regulation_document(regulation_document_name, organization_id)
-            analysis_json2 = analyze_regulation_step2(
-                analysis_json, regulation_text, regulation_document_name, temperature
+            regulation_text = await get_regulation_document(req.regulation_document_name, req.organizationId)
+            analysis_json2 = await analyze_regulation_step2(
+                analysis_json, regulation_text, req.regulation_document_name, req.temperature
             )
         except FileNotFoundError:
-            # If no regulation document found, continue with empty regulatory analysis
-            logger.warning(f"No regulation document found for organization {organization_id}, continuing without regulatory analysis")
             analysis_json2 = {
-                "regulation_document": regulation_document_name,
+                "regulation_document": req.regulation_document_name,
                 "relevant_passages": [],
                 "compliance_concerns": ["No regulation document found for analysis"],
                 "regulatory_keywords": [],
                 "analysis_timestamp": datetime.now().isoformat()
             }
         
-        # Step 3: Compliance Integration
-        logger.info(f"Job {job_id}: Step 3 - Integrating compliance findings")
-        analysis_json3 = analyze_compliance_step3(
-            analysis_json, analysis_json2, temperature
+        # Step 3
+        analysis_json3 = await analyze_compliance_step3(
+            analysis_json, analysis_json2, req.temperature
         )
         
-        # Prepare final response
         response_data = {
             "status": "success",
             "analysisJson": analysis_json,
@@ -399,11 +394,9 @@ def run_analysis_job(job_id, analysis_params):
             "processed_timestamp": datetime.now().isoformat()
         }
         
-        # Update job with results
         job_storage[job_id]['state'] = 'DONE'
         job_storage[job_id]['result'] = response_data
         job_storage[job_id]['completed_at'] = datetime.now().isoformat()
-        
         logger.info(f"Analysis job {job_id} completed successfully")
         
     except Exception as e:
@@ -412,333 +405,123 @@ def run_analysis_job(job_id, analysis_params):
         job_storage[job_id]['error'] = str(e)
         job_storage[job_id]['completed_at'] = datetime.now().isoformat()
 
-# Document Management Endpoints
+# --- API Endpoints ---
 
-@app.route('/api/organizations/<organization_id>/documents', methods=['GET'])
-def list_documents(organization_id):
-    """List all documents for an organization."""
-    try:
-        documents = list_organization_documents(organization_id)
-        return jsonify({
-            "organizationId": organization_id,
-            "documents": documents,
-            "count": len(documents)
-        })
-        
-    except Exception as e:
-        logger.error(f"Error listing documents for organization {organization_id}: {str(e)}")
-        return jsonify({"error": f"Failed to list documents: {str(e)}"}), 500
-
-@app.route('/api/organizations/<organization_id>/documents', methods=['POST'])
-def upload_organization_documents(organization_id):
-    """Upload documents to an organization's bucket."""
-    try:
-        if 'files' not in request.files:
-            return jsonify({"error": "No files provided"}), 400
-        
-        files = request.files.getlist('files')
-        if not files or all(f.filename == '' for f in files):
-            return jsonify({"error": "No files selected"}), 400
-        
-        uploaded_files = []
-        
-        for file in files:
-            if file and file.filename:
-                # Validate file type
-                if not file.filename.lower().endswith(('.pdf', '.PDF')):
-                    return jsonify({"error": f"Only PDF files are allowed. Got: {file.filename}"}), 400
-                
-                # Read file content
-                file_content = file.read()
-                
-                # Upload to organization bucket
-                final_filename = upload_file_to_organization_bucket(file_content, file.filename, organization_id)
-                uploaded_files.append(final_filename)
-        
-        logger.info(f"Successfully uploaded {len(uploaded_files)} files to organization {organization_id}")
-        return jsonify({
-            "organizationId": organization_id,
-            "files": uploaded_files, 
-            "message": f"Successfully uploaded {len(uploaded_files)} files"
-        })
-        
-    except Exception as e:
-        logger.error(f"File upload error for organization {organization_id}: {str(e)}")
-        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
-
-@app.route('/api/organizations/<organization_id>/documents/<document_name>', methods=['DELETE'])
-def delete_document(organization_id, document_name):
-    """Delete a document from an organization's bucket."""
-    try:
-        delete_organization_document(organization_id, document_name)
-        return jsonify({
-            "organizationId": organization_id,
-            "document": document_name,
-            "message": "Document deleted successfully"
-        })
-        
-    except FileNotFoundError as e:
-        return jsonify({"error": str(e)}), 404
-    except Exception as e:
-        logger.error(f"Error deleting document {document_name} for organization {organization_id}: {str(e)}")
-        return jsonify({"error": f"Failed to delete document: {str(e)}"}), 500
-
-# Updated existing endpoints to support organization_id
-
-@app.route('/api/upload', methods=['POST'])
-def upload_files():
-    """Upload regulation documents to organization's Cloud Storage bucket."""
-    try:
-        # Get organization ID from request
-        organization_id = request.form.get('organizationId') or request.args.get('organizationId')
-        if not organization_id:
-            return jsonify({"error": "organizationId is required"}), 400
-        
-        if 'files' not in request.files:
-            return jsonify({"error": "No files provided"}), 400
-        
-        files = request.files.getlist('files')
-        if not files or all(f.filename == '' for f in files):
-            return jsonify({"error": "No files selected"}), 400
-        
-        uploaded_files = []
-        
-        for file in files:
-            if file and file.filename:
-                # Validate file type
-                if not file.filename.lower().endswith(('.pdf', '.PDF')):
-                    return jsonify({"error": f"Only PDF files are allowed. Got: {file.filename}"}), 400
-                
-                # Read file content
-                file_content = file.read()
-                
-                # Upload to organization bucket
-                final_filename = upload_file_to_organization_bucket(file_content, file.filename, organization_id)
-                uploaded_files.append(final_filename)
-        
-        logger.info(f"Successfully uploaded {len(uploaded_files)} files to organization {organization_id}")
-        return jsonify({
-            "organizationId": organization_id,
-            "files": uploaded_files, 
-            "message": f"Successfully uploaded {len(uploaded_files)} files"
-        })
-        
-    except Exception as e:
-        logger.error(f"File upload error: {str(e)}")
-        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
-
-@app.route('/api/ai', methods=['POST'])
-def start_pipeline():
-    """Start analysis pipeline (async) - compatible with Gumloop interface."""
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-        
-        action = data.get('action')
-        if action != 'startPipeline':
-            return jsonify({"error": "Invalid action. Expected 'startPipeline'"}), 400
-        
-        # Extract required parameters
-        original_requirement = data.get('original_requirement')
-        regulation_document_name = data.get('regulation_document_name')
-        organization_id = data.get('organizationId')
-        
-        if not original_requirement:
-            return jsonify({"error": "original_requirement is required"}), 400
-        if not regulation_document_name:
-            return jsonify({"error": "regulation_document_name is required"}), 400
-        if not organization_id:
-            return jsonify({"error": "organizationId is required"}), 400
-        
-        # Generate job ID
-        job_id = str(uuid.uuid4())
-        
-        # Initialize job
-        job_storage[job_id] = {
-            'state': 'QUEUED',
-            'started_at': datetime.now().isoformat(),
-            'organization_id': organization_id
+@app.get(
+    "/health", 
+    tags=["System Health"],
+    summary="Health Check",
+    description="Check if the API service is running and healthy",
+    responses={
+        200: {
+            "description": "Service is healthy",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "status": "healthy",
+                        "timestamp": "2025-07-30T23:46:19.318168"
+                    }
+                }
+            }
         }
-        
-        # Start background job
-        analysis_params = {
-            'original_requirement': original_requirement,
-            'regulation_document_name': regulation_document_name,
-            'organization_id': organization_id,
-            'system_name': data.get('system_name', ''),
-            'objective': data.get('objective', ''),
-            'req_id': data.get('req_id', ''),
-            'temperature': data.get('temperature', 0.1)
-        }
-        
-        thread = threading.Thread(target=run_analysis_job, args=(job_id, analysis_params))
-        thread.daemon = True
-        thread.start()
-        
-        return jsonify({
-            "runId": job_id,
-            "organizationId": organization_id,
-            "state": "QUEUED",
-            "message": "Analysis pipeline started successfully"
-        })
-        
-    except Exception as e:
-        logger.error(f"Pipeline start error: {str(e)}")
-        return jsonify({"error": f"Failed to start pipeline: {str(e)}"}), 500
-
-@app.route('/api/ai', methods=['GET'])
-def get_pipeline_status():
-    """Get pipeline status - compatible with Gumloop interface."""
-    try:
-        run_id = request.args.get('runId')
-        organization_id = request.args.get('organizationId')
-        
-        if not run_id:
-            return jsonify({"error": "runId is required"}), 400
-        
-        if run_id not in job_storage:
-            return jsonify({"error": "Job not found"}), 404
-        
-        job = job_storage[run_id]
-        
-        response = {
-            "runId": run_id,
-            "organizationId": organization_id or job.get('organization_id', 'default'),
-            "state": job['state'],
-            "started_at": job.get('started_at'),
-            "completed_at": job.get('completed_at')
-        }
-        
-        if job['state'] == 'DONE':
-            response['result'] = job.get('result')
-        elif job['state'] == 'FAILED':
-            response['error'] = job.get('error')
-        
-        return jsonify(response)
-        
-    except Exception as e:
-        logger.error(f"Get pipeline status error: {str(e)}")
-        return jsonify({"error": f"Failed to get pipeline status: {str(e)}"}), 500
-
-@app.route('/openapi.yaml', methods=['GET'])
-def openapi_spec():
-    """Serve OpenAPI specification."""
-    try:
-        with open('openapi.yaml', 'r') as f:
-            return f.read(), 200, {'Content-Type': 'application/x-yaml'}
-    except FileNotFoundError:
-        return jsonify({"error": "OpenAPI specification not found"}), 404
-
-@app.route('/docs', methods=['GET'])
-def swagger_ui():
-    """Serve Swagger UI for interactive API documentation."""
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Requirements Analysis API - Documentation</title>
-        <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@3.52.5/swagger-ui.css" />
-        <style>
-            html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
-            *, *:before, *:after { box-sizing: inherit; }
-            body { margin:0; background: #fafafa; }
-        </style>
-    </head>
-    <body>
-        <div id="swagger-ui"></div>
-        <script src="https://unpkg.com/swagger-ui-dist@3.52.5/swagger-ui-bundle.js"></script>
-        <script src="https://unpkg.com/swagger-ui-dist@3.52.5/swagger-ui-standalone-preset.js"></script>
-        <script>
-            window.onload = function() {
-                const ui = SwaggerUIBundle({
-                    url: '/openapi.yaml',
-                    dom_id: '#swagger-ui',
-                    deepLinking: true,
-                    presets: [
-                        SwaggerUIBundle.presets.apis,
-                        SwaggerUIStandalonePreset
-                    ],
-                    plugins: [
-                        SwaggerUIBundle.plugins.DownloadUrl
-                    ],
-                    layout: "StandaloneLayout"
-                });
-            };
-        </script>
-    </body>
-    </html>
+    }
+)
+async def health_check():
     """
-    return html, 200, {'Content-Type': 'text/html'}
+    **Health Check Endpoint**
+    
+    Returns the current status of the API service along with a timestamp.
+    This endpoint requires no authentication and can be used for monitoring and load balancer health checks.
+    
+    **Returns:**
+    - `status`: Always "healthy" when the service is running
+    - `timestamp`: ISO formatted timestamp of when the check was performed
+    """
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint."""
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
-
-@app.route('/analyze-requirement', methods=['POST'])
-def analyze_requirement():
-    """Main endpoint for requirements analysis (synchronous)."""
+@app.post(
+    "/analyze-requirement", 
+    response_model=AnalysisResult, 
+    tags=["Requirements Analysis"],
+    summary="Analyze Requirements (Synchronous)",
+    description="Perform complete requirements analysis against INCOSE/EARS standards and regulatory compliance",
+    responses={
+        200: {
+            "description": "Analysis completed successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "status": "success",
+                        "organizationId": "atoms-tech",
+                        "analysisJson": {
+                            "req_id": "REQ-001",
+                            "original_requirement": "The system shall respond within 2 seconds",
+                            "incose_format": "The system shall respond to user requests within 2 seconds of input submission.",
+                            "ears_format": "When a user submits a request, the system shall respond within 2 seconds.",
+                            "quality_rating": "8"
+                        },
+                        "processed_timestamp": "2025-07-30T23:46:19.318168"
+                    }
+                }
+            }
+        },
+        422: {"description": "Validation Error"},
+        500: {"description": "Internal Server Error"}
+    }
+)
+async def analyze_requirement_sync(req: AnalysisRequest):
+    """
+    **Synchronous Requirements Analysis**
+    
+    Performs a complete three-step analysis of a software requirement:
+    
+    1. **INCOSE/EARS Analysis**: Evaluates requirement against industry standards
+    2. **Regulatory Research**: Searches uploaded regulation documents for relevant clauses
+    3. **Compliance Integration**: Produces enhanced, compliant requirements
+    
+    **Process:**
+    - Analyzes requirement structure and clarity
+    - Identifies violations of INCOSE and EARS standards
+    - Rewrites requirement in proper format
+    - Searches regulation documents for relevant passages
+    - Provides final compliant requirement with traceability
+    
+    **Requirements:**
+    - Valid organization ID with uploaded regulation documents
+    - Gemini API key configured in environment
+    - Proper authentication headers
+    
+    **Returns:**
+    Complete analysis results including original analysis, regulatory findings, and final enhanced requirements.
+    """
     try:
-        # Parse request data
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-            
-        # Extract required and optional parameters
-        original_requirement = data.get('original_requirement')
-        regulation_document_name = data.get('regulation_document_name')
-        organization_id = data.get('organizationId')
+        logger.info(f"Starting analysis for requirement: {req.original_requirement[:50]}...")
         
-        if not original_requirement:
-            return jsonify({"error": "original_requirement is required"}), 400
-        if not regulation_document_name:
-            return jsonify({"error": "regulation_document_name is required"}), 400
-        if not organization_id:
-            return jsonify({"error": "organizationId is required"}), 400
-            
-        # Optional parameters
-        system_name = data.get('system_name', '')
-        objective = data.get('objective', '')
-        req_id = data.get('req_id', '')
-        temperature = data.get('temperature', 0.1)
-        
-        logger.info(f"Starting analysis for requirement: {original_requirement[:50]}...")
-        
-        # Step 1: Initial Requirements Analysis
-        logger.info("Step 1: Analyzing requirement against INCOSE/EARS standards")
-        analysis_json = analyze_requirement_step1(
-            original_requirement, system_name, objective, req_id, temperature
+        analysis_json = await analyze_requirement_step1(
+            req.original_requirement, req.system_name, req.objective, req.req_id, req.temperature
         )
         
-        # Step 2: Regulatory Research
-        logger.info("Step 2: Analyzing regulatory compliance")
         try:
-            regulation_text = get_regulation_document(regulation_document_name, organization_id)
-            analysis_json2 = analyze_regulation_step2(
-                analysis_json, regulation_text, regulation_document_name, temperature
+            regulation_text = await get_regulation_document(req.regulation_document_name, req.organizationId)
+            analysis_json2 = await analyze_regulation_step2(
+                analysis_json, regulation_text, req.regulation_document_name, req.temperature
             )
         except FileNotFoundError:
-            # If no regulation document found, continue with empty regulatory analysis
-            logger.warning(f"No regulation document found for organization {organization_id}, continuing without regulatory analysis")
             analysis_json2 = {
-                "regulation_document": regulation_document_name,
+                "regulation_document": req.regulation_document_name,
                 "relevant_passages": [],
                 "compliance_concerns": ["No regulation document found for analysis"],
                 "regulatory_keywords": [],
                 "analysis_timestamp": datetime.now().isoformat()
             }
         
-        # Step 3: Compliance Integration
-        logger.info("Step 3: Integrating compliance findings")
-        analysis_json3 = analyze_compliance_step3(
-            analysis_json, analysis_json2, temperature
+        analysis_json3 = await analyze_compliance_step3(
+            analysis_json, analysis_json2, req.temperature
         )
         
-        # Prepare final response
         response_data = {
             "status": "success",
-            "organizationId": organization_id,
+            "organizationId": req.organizationId,
             "analysisJson": analysis_json,
             "analysisJson2": analysis_json2, 
             "analysisJson3": analysis_json3,
@@ -746,27 +529,380 @@ def analyze_requirement():
         }
         
         logger.info("Analysis completed successfully")
-        return jsonify(response_data)
+        return response_data
         
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {str(e)}")
-        return jsonify({"error": f"Invalid JSON in AI response: {str(e)}"}), 500
-        
+        raise HTTPException(status_code=500, detail=f"Invalid JSON in AI response: {str(e)}")
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+        logger.error(f"Unexpected error: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-if __name__ == '__main__':
-    # Verify required environment variables
-    required_env_vars = [
-        'GEMINI_API_KEY'
-    ]
+@app.get(
+    "/api/organizations/{organization_id}/documents", 
+    tags=["Document Management"],
+    summary="List Organization Documents",
+    description="Retrieve all uploaded documents for a specific organization",
+    responses={
+        200: {
+            "description": "List of documents retrieved successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "organizationId": "atoms-tech",
+                        "documents": [
+                            {
+                                "name": "ISO_27001.pdf",
+                                "size": 2048576,
+                                "created": "2025-07-30T10:00:00.000Z",
+                                "updated": "2025-07-30T10:00:00.000Z"
+                            }
+                        ],
+                        "count": 1
+                    }
+                }
+            }
+        },
+        404: {"description": "Organization not found"},
+        500: {"description": "Internal Server Error"}
+    }
+)
+async def list_documents(organization_id: str):
+    """
+    **List Organization Documents**
     
+    Retrieves all regulation documents uploaded for the specified organization.
+    Documents are stored in organization-specific Cloud Storage buckets.
+    
+    **Parameters:**
+    - `organization_id`: Unique identifier for the organization
+    
+    **Returns:**
+    - List of documents with metadata (name, size, timestamps)
+    - Total count of documents
+    - Organization ID for verification
+    
+    **Document Storage:**
+    - Each organization has an isolated storage bucket
+    - Only PDF documents are accepted
+    - Automatic versioning for duplicate filenames
+    """
+    documents = await list_organization_documents(organization_id)
+    return {
+        "organizationId": organization_id,
+        "documents": documents,
+        "count": len(documents)
+    }
+
+@app.post(
+    "/api/organizations/{organization_id}/documents", 
+    tags=["Document Management"],
+    summary="Upload Organization Documents",
+    description="Upload PDF regulation documents to an organization's secure storage",
+    responses={
+        200: {
+            "description": "Documents uploaded successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "organizationId": "atoms-tech",
+                        "files": ["ISO_27001.pdf", "GDPR_regulation.pdf"],
+                        "message": "Successfully uploaded 2 files"
+                    }
+                }
+            }
+        },
+        400: {"description": "Invalid file format (only PDF allowed)"},
+        500: {"description": "Upload failed"}
+    }
+)
+async def upload_organization_documents(organization_id: str, files: List[UploadFile] = File(...)):
+    """
+    **Upload Organization Documents**
+    
+    Upload regulation documents (PDFs only) to the organization's secure storage bucket.
+    These documents will be used for regulatory compliance analysis.
+    
+    **Parameters:**
+    - `organization_id`: Unique identifier for the organization
+    - `files`: One or more PDF files to upload
+    
+    **File Requirements:**
+    - Must be PDF format (.pdf extension)
+    - Reasonable file size limits apply
+    - Duplicate filenames are automatically versioned
+    
+    **Security:**
+    - Each organization has isolated storage
+    - Files are securely stored in Google Cloud Storage
+    - Access controlled by organization membership
+    
+    **Returns:**
+    - List of successfully uploaded filenames
+    - Upload confirmation message
+    - Organization ID for verification
+    """
+    uploaded_files = []
+    for file in files:
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail=f"Only PDF files are allowed. Got: {file.filename}")
+        
+        file_content = await file.read()
+        final_filename = await upload_file_to_organization_bucket(file_content, file.filename, organization_id)
+        uploaded_files.append(final_filename)
+    
+    logger.info(f"Successfully uploaded {len(uploaded_files)} files to organization {organization_id}")
+    return {
+        "organizationId": organization_id,
+        "files": uploaded_files, 
+        "message": f"Successfully uploaded {len(uploaded_files)} files"
+    }
+
+@app.delete(
+    "/api/organizations/{organization_id}/documents/{document_name}", 
+    tags=["Document Management"],
+    summary="Delete Organization Document",
+    description="Permanently delete a regulation document from organization storage",
+    responses={
+        200: {
+            "description": "Document deleted successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "organizationId": "atoms-tech",
+                        "document": "ISO_27001.pdf",
+                        "message": "Document deleted successfully"
+                    }
+                }
+            }
+        },
+        404: {"description": "Document or organization not found"},
+        500: {"description": "Delete operation failed"}
+    }
+)
+async def delete_document(organization_id: str, document_name: str):
+    """
+    **Delete Organization Document**
+    
+    Permanently removes a regulation document from the organization's storage.
+    This action cannot be undone.
+    
+    **Parameters:**
+    - `organization_id`: Unique identifier for the organization
+    - `document_name`: Exact filename of the document to delete
+    
+    **Security:**
+    - Only documents belonging to the specified organization can be deleted
+    - Requires proper authentication and organization membership
+    - Action is logged for audit purposes
+    
+    **Warning:**
+    Deleting a document may affect ongoing or future requirements analysis
+    that depends on that regulation document.
+    
+    **Returns:**
+    - Confirmation of successful deletion
+    - Organization and document identifiers
+    """
+    await delete_organization_document(organization_id, document_name)
+    return {
+        "organizationId": organization_id,
+        "document": document_name,
+        "message": "Document deleted successfully"
+    }
+
+@app.post(
+    "/api/upload", 
+    tags=["Document Management (Legacy)"],
+    summary="Upload Documents (Legacy)",
+    description="Legacy endpoint for uploading documents. Use /api/organizations/{id}/documents instead.",
+    deprecated=True,
+    responses={
+        200: {"description": "Documents uploaded successfully"},
+        400: {"description": "Invalid file format"},
+        500: {"description": "Upload failed"}
+    }
+)
+async def upload_files_legacy(organizationId: str = Form(...), files: List[UploadFile] = File(...)):
+    """
+    **Legacy File Upload Endpoint**
+    
+    ⚠️ **DEPRECATED**: This endpoint is maintained for backward compatibility only.
+    
+    **Recommended Alternative:**
+    Use `POST /api/organizations/{organization_id}/documents` instead.
+    
+    **Functionality:**
+    Same as the modern upload endpoint but uses form parameters instead of URL path.
+    
+    **Migration:**
+    Replace calls to this endpoint with the new document management endpoints
+    for better REST compliance and improved functionality.
+    """
+    return await upload_organization_documents(organizationId, files)
+
+@app.post(
+    "/api/ai", 
+    tags=["Requirements Analysis"],
+    summary="Start Analysis Pipeline (Asynchronous)",
+    description="Start a requirements analysis job that runs in the background",
+    responses={
+        200: {
+            "description": "Analysis pipeline started successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "runId": "550e8400-e29b-41d4-a716-446655440000",
+                        "organizationId": "atoms-tech",
+                        "state": "QUEUED",
+                        "message": "Analysis pipeline started successfully"
+                    }
+                }
+            }
+        },
+        422: {"description": "Validation Error"},
+        500: {"description": "Failed to start pipeline"}
+    }
+)
+async def start_pipeline(req: PipelineRequest, background_tasks: BackgroundTasks):
+    """
+    **Start Asynchronous Analysis Pipeline**
+    
+    Initiates a background analysis job for requirements processing. This is useful for:
+    - Processing multiple requirements
+    - Long-running analysis tasks
+    - Integration with external workflow systems
+    
+    **Process:**
+    1. Validates input parameters
+    2. Creates a unique job ID
+    3. Queues the analysis job
+    4. Returns immediately with job ID
+    
+    **Use Cases:**
+    - Batch processing of requirements
+    - Integration with Gumloop or similar platforms
+    - When immediate response is not required
+    
+    **Returns:**
+    - `runId`: Unique identifier to track job progress
+    - `state`: Initial state (always "QUEUED")
+    - Organization ID for verification
+    
+    **Next Steps:**
+    Use the GET /api/ai endpoint with the returned `runId` to check progress and retrieve results.
+    """
+    job_id = str(uuid.uuid4())
+    job_storage[job_id] = {
+        'state': 'QUEUED',
+        'started_at': datetime.now().isoformat(),
+        'organization_id': req.organizationId
+    }
+    
+    background_tasks.add_task(run_analysis_job, job_id, req.dict())
+    
+    return {
+        "runId": job_id,
+        "organizationId": req.organizationId,
+        "state": "QUEUED",
+        "message": "Analysis pipeline started successfully"
+    }
+
+@app.get(
+    "/api/ai", 
+    tags=["Requirements Analysis"],
+    summary="Get Analysis Pipeline Status",
+    description="Check the status and retrieve results of an asynchronous analysis job",
+    responses={
+        200: {
+            "description": "Pipeline status retrieved successfully",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "running": {
+                            "summary": "Job in progress",
+                            "value": {
+                                "runId": "550e8400-e29b-41d4-a716-446655440000",
+                                "organizationId": "atoms-tech",
+                                "state": "RUNNING",
+                                "started_at": "2025-07-30T23:46:19.318168"
+                            }
+                        },
+                        "completed": {
+                            "summary": "Job completed",
+                            "value": {
+                                "runId": "550e8400-e29b-41d4-a716-446655440000",
+                                "organizationId": "atoms-tech",
+                                "state": "DONE",
+                                "started_at": "2025-07-30T23:46:19.318168",
+                                "completed_at": "2025-07-30T23:47:25.123456",
+                                "result": {
+                                    "status": "success",
+                                    "analysisJson": "...",
+                                    "analysisJson2": "...",
+                                    "analysisJson3": "..."
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        404: {"description": "Job not found"},
+        500: {"description": "Internal Server Error"}
+    }
+)
+async def get_pipeline_status(runId: str, organizationId: str = None):
+    """
+    **Get Analysis Pipeline Status**
+    
+    Retrieves the current status and results of an asynchronous analysis job.
+    
+    **Parameters:**
+    - `runId`: Unique job identifier from the POST /api/ai response
+    - `organizationId`: Optional organization ID for additional verification
+    
+    **Job States:**
+    - `QUEUED`: Job is waiting to be processed
+    - `RUNNING`: Job is currently being processed
+    - `DONE`: Job completed successfully with results available
+    - `FAILED`: Job failed with error details available
+    
+    **Polling:**
+    - Check status periodically until state is DONE or FAILED
+    - Typical processing time: 30-60 seconds per requirement
+    - Results are cached for 24 hours after completion
+    
+    **Returns:**
+    - Current job state and timestamps
+    - Complete analysis results when DONE
+    - Error details when FAILED
+    """
+    if runId not in job_storage:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = job_storage[runId]
+    response = {
+        "runId": runId,
+        "organizationId": organizationId or job.get('organization_id', 'default'),
+        "state": job['state'],
+        "started_at": job.get('started_at'),
+        "completed_at": job.get('completed_at')
+    }
+    
+    if job['state'] == 'DONE':
+        response['result'] = job.get('result')
+    elif job['state'] == 'FAILED':
+        response['error'] = job.get('error')
+    
+    return response
+
+if __name__ == "__main__":
+    import uvicorn
+    required_env_vars = ['GEMINI_API_KEY']
     missing_vars = [var for var in required_env_vars if not os.getenv(var)]
     if missing_vars:
         logger.error(f"Missing required environment variables: {missing_vars}")
         exit(1)
     
-    port = int(os.getenv('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False) 
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)

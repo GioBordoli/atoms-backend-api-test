@@ -29,7 +29,7 @@ This document lists all the environment variables required for the Requirements 
 - **How to get**: Base64 encode your service account JSON key file
 
 ### 4. PORT (Optional)
-- **Purpose**: Port number for the Flask application
+- **Purpose**: Port number for the FastAPI application
 - **Type**: Integer
 - **Default**: 8080
 - **Example**: `8080`

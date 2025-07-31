@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Requirements Analysis API provides comprehensive analysis of engineering requirements using EARS and INCOSE standards, with regulatory compliance checking. It replaces the existing Gumloop flow with a Flask-based backend powered by Google Gemini 2.0 Flash.
+The Requirements Analysis API provides comprehensive analysis of engineering requirements using EARS and INCOSE standards, with regulatory compliance checking. It replaces the existing Gumloop flow with a FastAPI-based backend powered by Google Gemini 2.0 Flash.
 
 ## Base URL
 

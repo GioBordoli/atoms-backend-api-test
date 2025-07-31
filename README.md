@@ -1,6 +1,6 @@
 # Requirements Analysis API
 
-A comprehensive Flask API for analyzing engineering requirements using INCOSE and EARS standards with regulatory compliance checking. The API integrates with Google Cloud Storage for organization-based document management and uses Google Gemini 2.0 Flash for AI-powered analysis.
+A comprehensive FastAPI API for analyzing engineering requirements using INCOSE and EARS standards with regulatory compliance checking. The API integrates with Google Cloud Storage for organization-based document management and uses Google Gemini 2.0 Flash for AI-powered analysis.
 
 ## Features
 

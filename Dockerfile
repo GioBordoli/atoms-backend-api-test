@@ -8,8 +8,9 @@ ENV PYTHONUNBUFFERED=1
 # Set work directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Install system dependencies, including build-essential for compiling packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     gcc \
     g++ \
     && rm -rf /var/lib/apt/lists/*
@@ -32,4 +33,4 @@ USER app
 EXPOSE 8080
 
 # Run the application
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "4", "--timeout", "120", "app:app"] 
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"] 
