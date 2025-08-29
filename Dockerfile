@@ -32,5 +32,5 @@ USER app
 # Expose port
 EXPOSE 8080
 
-# Run the application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"] 
+# Run the application (wrapper app that mounts legacy app and /v1 alias)
+CMD ["uvicorn", "atoms_api.main:app", "--host", "0.0.0.0", "--port", "8080"] 

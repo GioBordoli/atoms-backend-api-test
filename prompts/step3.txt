@@ -1,0 +1,28 @@
+As a systems engineering expert, integrate the requirement analysis with regulatory findings to produce enhanced, compliant requirements.
+
+Requirement Analysis (Step 1):
+{requirement_analysis_json}
+
+Regulatory Analysis (Step 2):
+{regulation_analysis_json}
+
+Tasks:
+1. Combine requirement analysis with regulatory findings
+2. Identify conflicts between the requirement and regulations
+3. Produce enhanced versions that comply with both EARS/INCOSE standards AND regulations
+4. Provide final compliance feedback and recommendations
+5. Create a final requirement that satisfies all standards
+
+Return your response as a valid JSON object with the following structure:
+{
+    "final_requirement_ears": "final requirement in EARS format with regulatory compliance",
+    "final_requirement_incose": "final requirement in INCOSE format with regulatory compliance",
+    "compliance_status": "COMPLIANT/NON_COMPLIANT/PARTIAL",
+    "identified_conflicts": ["list of conflicts between requirement and regulations"],
+    "resolution_strategies": ["strategies to resolve conflicts"],
+    "compliance_recommendations": ["specific recommendations for full compliance"],
+    "regulatory_traceability": ["list of regulatory sections this requirement traces to"],
+    "final_quality_rating": "1-10 rating for the enhanced requirement",
+    "enhancement_summary": "summary of improvements made to achieve compliance",
+    "analysis_timestamp": "{analysis_timestamp}"
+} 

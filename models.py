@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Literal
 
 class AnalysisRequest(BaseModel):
     original_requirement: str
@@ -10,8 +10,22 @@ class AnalysisRequest(BaseModel):
     req_id: Optional[str] = ""
     temperature: Optional[float] = Field(0.1, ge=0.0, le=1.0)
 
-class PipelineRequest(AnalysisRequest):
-    action: str = "startPipeline"
+class PipelineInput(BaseModel):
+    input_name: str
+    value: str
+
+class PipelineStartParams(BaseModel):
+    pipelineType: Optional[Literal['file-processing','requirement-analysis','requirement-analysis-reasoning','text-to-mermaid']] = None
+    requirement: Optional[str] = None
+    fileNames: Optional[List[str]] = None
+    systemName: Optional[str] = None
+    objective: Optional[str] = None
+    model_preference: Optional[str] = None
+    temperature: Optional[float] = Field(default=0.1, ge=0.0, le=1.0)
+    customPipelineInputs: Optional[List[PipelineInput]] = None
+    savedItemId: Optional[str] = None
+    # Optional organizationId for internal mapping; not required by frontend today
+    organizationId: Optional[str] = None
 
 class Step1Analysis(BaseModel):
     req_id: str

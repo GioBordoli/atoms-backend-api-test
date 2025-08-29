@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form, Query, Path as FPath
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any
 import google.generativeai as genai
@@ -13,9 +13,10 @@ import traceback
 import uuid
 from werkzeug.utils import secure_filename
 import re
+from pathlib import Path
 
 # Import Pydantic models
-from models import AnalysisRequest, PipelineRequest, AnalysisResult
+from models import AnalysisRequest, PipelineStartParams, AnalysisResult
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -59,9 +60,10 @@ Built with FastAPI and deployed on Google Cloud Run.
 )
 
 # Enable CORS
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,https://atoms.tech")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,6 +80,20 @@ storage_client = storage.Client()
 job_storage: Dict[str, Dict[str, Any]] = {}
 
 # --- Helper Functions ---
+
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+def _read_prompt_template(filename: str) -> str:
+    template_path = PROMPTS_DIR / filename
+    with open(template_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+def _format_prompt(template: str, replacements: Dict[str, str]) -> str:
+    # Simple placeholder replacement without interfering with JSON braces
+    rendered = template
+    for key, value in replacements.items():
+        rendered = rendered.replace(f"{{{key}}}", value)
+    return rendered
 
 def get_organization_bucket_name(organization_id: str) -> str:
     """Get bucket name for organization."""
@@ -212,46 +228,14 @@ async def upload_file_to_organization_bucket(file_content: bytes, filename: str,
 
 async def analyze_requirement_step1(original_requirement: str, system_name: str = "", objective: str = "", req_id: str = "", temperature: float = 0.1) -> Dict:
     """Step 1: Initial Requirements Analysis using INCOSE and EARS standards."""
-    prompt = f"""
-    As a requirements engineering expert, analyze the following requirement against INCOSE and EARS (Easy Approach to Requirements Syntax) standards.
-
-    System Name: {system_name}
-    Objective: {objective}
-    Original Requirement: {original_requirement}
-    REQ-ID: {req_id}
-
-    Please provide a comprehensive analysis that includes:
-
-    1. INCOSE Format Analysis:
-       - Rewrite the requirement following INCOSE best practices
-       - Identify any INCOSE rule violations
-       - Provide feedback on clarity, completeness, and correctness
-
-    2. EARS Format Analysis:
-       - Rewrite the requirement in EARS format (When <trigger>, the <system> shall <response>)
-       - Identify the trigger, system, and response components
-       - Provide feedback on EARS compliance
-
-    3. Structured Analysis:
-       - Extract/assign REQ_ID if not provided
-       - Identify requirement patterns (functional, performance, interface, etc.)
-       - List specific violations and recommendations
-       - Rate the requirement quality (1-10 scale)
-
-    Return your response as a valid JSON object with the following structure:
-    {{
-        "req_id": "extracted or provided REQ_ID",
-        "original_requirement": "the original requirement text",
-        "incose_format": "requirement rewritten in INCOSE format",
-        "ears_format": "requirement rewritten in EARS format", 
-        "incose_violations": ["list of INCOSE violations found"],
-        "ears_violations": ["list of EARS violations found"],
-        "requirement_pattern": "functional/performance/interface/etc",
-        "quality_rating": "1-10 rating",
-        "feedback": "detailed feedback and recommendations",
-        "analysis_timestamp": "{datetime.now().isoformat()}"
-    }}
-    """
+    template = _read_prompt_template("step1.txt")
+    prompt = _format_prompt(template, {
+        "system_name": system_name or "",
+        "objective": objective or "",
+        "original_requirement": original_requirement or "",
+        "req_id": req_id or "",
+        "analysis_timestamp": datetime.now().isoformat(),
+    })
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = await model.generate_content_async(
@@ -266,37 +250,13 @@ async def analyze_requirement_step1(original_requirement: str, system_name: str 
 
 async def analyze_regulation_step2(requirement_analysis: Dict, regulation_text: str, regulation_doc_name: str, temperature: float = 0.1) -> Dict:
     """Step 2: Regulatory Research and Compliance Analysis."""
-    prompt = f"""
-    As a regulatory compliance expert, analyze the following requirement against the provided regulation document.
-
-    Requirement Analysis from Step 1:
-    {json.dumps(requirement_analysis, indent=2)}
-
-    Regulation Document: {regulation_doc_name}
-    Regulation Text: {regulation_text[:10000]}...  # Truncate for context limit
-
-    Tasks:
-    1. Search through the regulation text for passages relevant to this requirement
-    2. Identify specific regulatory clauses, sections, or standards that apply
-    3. Extract relevant regulatory text that could impact the requirement
-    4. Assess potential compliance issues or conflicts
-
-    Return your response as a valid JSON object with the following structure:
-    {{
-        "regulation_document": "{regulation_doc_name}",
-        "relevant_passages": [
-            {{
-                "section": "section/clause identifier",
-                "text": "relevant regulatory text",
-                "relevance_score": "1-10 how relevant this passage is",
-                "impact": "description of how this impacts the requirement"
-            }}
-        ],
-        "compliance_concerns": ["list of potential compliance issues"],
-        "regulatory_keywords": ["key terms found in regulation relevant to requirement"],
-        "analysis_timestamp": "{datetime.now().isoformat()}"
-    }}
-    """
+    template = _read_prompt_template("step2.txt")
+    prompt = _format_prompt(template, {
+        "requirement_analysis_json": json.dumps(requirement_analysis, indent=2),
+        "regulation_doc_name": regulation_doc_name,
+        "regulation_text": (regulation_text[:10000] + ("..." if len(regulation_text) > 10000 else "")),
+        "analysis_timestamp": datetime.now().isoformat(),
+    })
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = await model.generate_content_async(
@@ -311,36 +271,12 @@ async def analyze_regulation_step2(requirement_analysis: Dict, regulation_text: 
 
 async def analyze_compliance_step3(requirement_analysis: Dict, regulation_analysis: Dict, temperature: float = 0.1) -> Dict:
     """Step 3: Compliance Integration and Enhanced Requirements."""
-    prompt = f"""
-    As a systems engineering expert, integrate the requirement analysis with regulatory findings to produce enhanced, compliant requirements.
-
-    Requirement Analysis (Step 1):
-    {json.dumps(requirement_analysis, indent=2)}
-
-    Regulatory Analysis (Step 2): 
-    {json.dumps(regulation_analysis, indent=2)}
-
-    Tasks:
-    1. Combine requirement analysis with regulatory findings
-    2. Identify conflicts between the requirement and regulations
-    3. Produce enhanced versions that comply with both EARS/INCOSE standards AND regulations
-    4. Provide final compliance feedback and recommendations
-    5. Create a final requirement that satisfies all standards
-
-    Return your response as a valid JSON object with the following structure:
-    {{
-        "final_requirement_ears": "final requirement in EARS format with regulatory compliance",
-        "final_requirement_incose": "final requirement in INCOSE format with regulatory compliance", 
-        "compliance_status": "COMPLIANT/NON_COMPLIANT/PARTIAL",
-        "identified_conflicts": ["list of conflicts between requirement and regulations"],
-        "resolution_strategies": ["strategies to resolve conflicts"],
-        "compliance_recommendations": ["specific recommendations for full compliance"],
-        "regulatory_traceability": ["list of regulatory sections this requirement traces to"],
-        "final_quality_rating": "1-10 rating for the enhanced requirement",
-        "enhancement_summary": "summary of improvements made to achieve compliance",
-        "analysis_timestamp": "{datetime.now().isoformat()}"
-    }}
-    """
+    template = _read_prompt_template("step3.txt")
+    prompt = _format_prompt(template, {
+        "requirement_analysis_json": json.dumps(requirement_analysis, indent=2),
+        "regulation_analysis_json": json.dumps(regulation_analysis, indent=2),
+        "analysis_timestamp": datetime.now().isoformat(),
+    })
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = await model.generate_content_async(
@@ -401,6 +337,215 @@ async def run_analysis_job(job_id: str, analysis_params: Dict):
         
     except Exception as e:
         logger.error(f"Job {job_id} failed: {str(e)}")
+        job_storage[job_id]['state'] = 'FAILED'
+        job_storage[job_id]['error'] = str(e)
+        job_storage[job_id]['completed_at'] = datetime.now().isoformat()
+
+# --- GCS requirements persistence helpers ---
+
+def _requirements_prefix() -> str:
+    return "requirements"
+
+def _inputs_prefix() -> str:
+    return "inputs"
+
+def _index_blob(bucket: storage.Bucket) -> storage.Blob:
+    return bucket.blob(f"{_requirements_prefix()}/index.json")
+
+def _load_index(bucket: storage.Bucket) -> Dict[str, Any]:
+    blob = _index_blob(bucket)
+    if not blob.exists():
+        return {"last_id": 0}
+    content = blob.download_as_text()
+    try:
+        return json.loads(content)
+    except Exception:
+        return {"last_id": 0}
+
+def _save_index_with_cas(bucket: storage.Bucket, new_index: Dict[str, Any], expected_generation: int) -> bool:
+    blob = _index_blob(bucket)
+    data = json.dumps(new_index).encode("utf-8")
+    try:
+        blob.upload_from_string(data, if_generation_match=expected_generation, content_type="application/json")
+        return True
+    except Exception as e:
+        logger.warning(f"Index CAS write failed: {e}")
+        return False
+
+def _next_req_id(bucket: storage.Bucket) -> str:
+    # CAS loop to increment last_id
+    blob = _index_blob(bucket)
+    while True:
+        current_generation = 0
+        if blob.exists():
+            blob.reload()
+            current_generation = blob.generation or 0
+        index = _load_index(bucket)
+        next_id = (index.get("last_id") or 0) + 1
+        new_index = {"last_id": next_id}
+        if _save_index_with_cas(bucket, new_index, expected_generation=current_generation):
+            return f"{next_id:04d}"
+
+async def _persist_input_json(organization_id: str, req_id: str, payload: Dict[str, Any]):
+    bucket = create_bucket_if_not_exists(get_organization_bucket_name(organization_id))
+    blob = bucket.blob(f"{_inputs_prefix()}/{req_id}.json")
+    blob.upload_from_string(json.dumps(payload), content_type="application/json")
+
+async def _persist_requirement_json(organization_id: str, req_id: str, record: Dict[str, Any]):
+    bucket = create_bucket_if_not_exists(get_organization_bucket_name(organization_id))
+    blob = bucket.blob(f"{_requirements_prefix()}/{req_id}.json")
+    blob.upload_from_string(json.dumps(record), content_type="application/json")
+
+async def _get_requirement_json(organization_id: str, req_id: str) -> Dict[str, Any]:
+    bucket = storage_client.bucket(get_organization_bucket_name(organization_id))
+    blob = bucket.blob(f"{_requirements_prefix()}/{req_id}.json")
+    if not blob.exists():
+        raise FileNotFoundError("Requirement not found")
+    return json.loads(blob.download_as_text())
+
+async def _list_requirements(organization_id: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+    bucket = storage_client.bucket(get_organization_bucket_name(organization_id))
+    if not bucket.exists():
+        return {"items": [], "total": 0, "page": page, "pageSize": page_size}
+    prefix = f"{_requirements_prefix()}/"
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    items = []
+    for b in blobs:
+        if not b.name.endswith(".json") or b.name.endswith("index.json"):
+            continue
+        try:
+            items.append(json.loads(b.download_as_text()))
+        except Exception:
+            continue
+    items.sort(key=lambda r: r.get("req_id", ""))
+    total = len(items)
+    start = max((page - 1) * page_size, 0)
+    end = start + page_size
+    return {"items": items[start:end], "total": total, "page": page, "pageSize": page_size}
+
+# --- Mapping to legacy outputs ---
+
+def _build_legacy_outputs(result: Dict[str, Any]) -> Dict[str, Any]:
+    analysis = result.get("analysisJson", {})
+    regulation = result.get("analysisJson2", {})
+    final = result.get("analysisJson3", {})
+
+    # analysisJson array element
+    a = {
+        "Original Requirement": analysis.get("original_requirement", ""),
+        "EARS Generated Requirement": analysis.get("ears_format", ""),
+        "EARS Pattern": analysis.get("requirement_pattern", ""),
+        "EARS_SYNTAX_TEMPLATE": "When <trigger>, the <system> shall <response>",
+        "INCOSE_FORMAT": analysis.get("incose_format", ""),
+        "INCOSE_REQUIREMENT_FEEDBACK": analysis.get("feedback", ""),
+    }
+
+    # analysisJson2 array element
+    relevant = []
+    for p in regulation.get("relevant_passages", []) or []:
+        section = p.get("section") or ""
+        text = p.get("text") or ""
+        if section or text:
+            relevant.append(f"{section}: {text}".strip())
+    compliance_feedback = "; ".join(regulation.get("compliance_concerns", []) or [])
+    b = {
+        "RELEVANT_REGULATIONS": relevant,
+        "COMPLIANCE_FEEDBACK": compliance_feedback,
+    }
+
+    # analysisJson3 array element
+    c = {
+        "ENHANCED_REQUIREMENT_EARS": final.get("final_requirement_ears", ""),
+        "ENHANCED_REQUIREMENT_INCOSE": final.get("final_requirement_incose", ""),
+        "ENHANCED_GENERAL_FEEDBACK": final.get("enhancement_summary", ""),
+    }
+
+    return {
+        "analysisJson": [json.dumps(a)],
+        "analysisJson2": [json.dumps(b)],
+        "analysisJson3": [json.dumps(c)],
+    }
+
+# --- Pipeline job orchestrator for Gumloop parity ---
+
+async def run_pipeline_job(job_id: str, params: Dict[str, Any]):
+    try:
+        job_storage[job_id]['state'] = 'RUNNING'
+        start = PipelineStartParams(**params)
+        pipeline_type = start.pipelineType or 'requirement-analysis'
+
+        if pipeline_type == 'text-to-mermaid':
+            # Minimal stub for canvas flow
+            job_storage[job_id]['state'] = 'DONE'
+            job_storage[job_id]['result'] = {
+                "status": "success",
+                "outputs": {
+                    "output": json.dumps({"mermaid_syntax": "graph TD; A-->B;"})
+                },
+                "processed_timestamp": datetime.now().isoformat()
+            }
+            job_storage[job_id]['completed_at'] = datetime.now().isoformat()
+            return
+
+        # Determine inputs
+        organization_id = start.organizationId or job_storage[job_id].get('organization_id') or 'default'
+        original_requirement = start.requirement or ""
+        system_name = start.systemName or ""
+        objective = start.objective or ""
+        temperature = start.temperature or 0.1
+        regulation_document_name = None
+        if start.fileNames and len(start.fileNames) > 0:
+            regulation_document_name = start.fileNames[0]
+        else:
+            regulation_document_name = ""
+
+        # Step 1
+        analysis_json = await analyze_requirement_step1(
+            original_requirement, system_name, objective, "", temperature
+        )
+
+        # Step 2 (optional)
+        try:
+            if regulation_document_name:
+                regulation_text = await get_regulation_document(regulation_document_name, organization_id)
+                analysis_json2 = await analyze_regulation_step2(
+                    analysis_json, regulation_text, regulation_document_name, temperature
+                )
+            else:
+                analysis_json2 = {
+                    "regulation_document": regulation_document_name or "",
+                    "relevant_passages": [],
+                    "compliance_concerns": [],
+                    "regulatory_keywords": [],
+                    "analysis_timestamp": datetime.now().isoformat()
+                }
+        except FileNotFoundError:
+            analysis_json2 = {
+                "regulation_document": regulation_document_name or "",
+                "relevant_passages": [],
+                "compliance_concerns": ["No regulation document found for analysis"],
+                "regulatory_keywords": [],
+                "analysis_timestamp": datetime.now().isoformat()
+            }
+
+        # Step 3
+        analysis_json3 = await analyze_compliance_step3(
+            analysis_json, analysis_json2, temperature
+        )
+
+        response_data = {
+            "status": "success",
+            "analysisJson": analysis_json,
+            "analysisJson2": analysis_json2,
+            "analysisJson3": analysis_json3,
+            "processed_timestamp": datetime.now().isoformat()
+        }
+
+        job_storage[job_id]['state'] = 'DONE'
+        job_storage[job_id]['result'] = response_data
+        job_storage[job_id]['completed_at'] = datetime.now().isoformat()
+    except Exception as e:
+        logger.error(f"Pipeline job {job_id} failed: {str(e)}")
         job_storage[job_id]['state'] = 'FAILED'
         job_storage[job_id]['error'] = str(e)
         job_storage[job_id]['completed_at'] = datetime.now().isoformat()
@@ -746,65 +891,22 @@ async def upload_files_legacy(organizationId: str = Form(...), files: List[Uploa
     summary="Start Analysis Pipeline (Asynchronous)",
     description="Start a requirements analysis job that runs in the background",
     responses={
-        200: {
-            "description": "Analysis pipeline started successfully",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "runId": "550e8400-e29b-41d4-a716-446655440000",
-                        "organizationId": "atoms-tech",
-                        "state": "QUEUED",
-                        "message": "Analysis pipeline started successfully"
-                    }
-                }
-            }
-        },
+        200: {"description": "Analysis pipeline started successfully"},
         422: {"description": "Validation Error"},
         500: {"description": "Failed to start pipeline"}
     }
 )
-async def start_pipeline(req: PipelineRequest, background_tasks: BackgroundTasks):
-    """
-    **Start Asynchronous Analysis Pipeline**
-    
-    Initiates a background analysis job for requirements processing. This is useful for:
-    - Processing multiple requirements
-    - Long-running analysis tasks
-    - Integration with external workflow systems
-    
-    **Process:**
-    1. Validates input parameters
-    2. Creates a unique job ID
-    3. Queues the analysis job
-    4. Returns immediately with job ID
-    
-    **Use Cases:**
-    - Batch processing of requirements
-    - Integration with Gumloop or similar platforms
-    - When immediate response is not required
-    
-    **Returns:**
-    - `runId`: Unique identifier to track job progress
-    - `state`: Initial state (always "QUEUED")
-    - Organization ID for verification
-    
-    **Next Steps:**
-    Use the GET /api/ai endpoint with the returned `runId` to check progress and retrieve results.
-    """
+async def start_pipeline(req: PipelineStartParams, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     job_storage[job_id] = {
         'state': 'QUEUED',
         'started_at': datetime.now().isoformat(),
-        'organization_id': req.organizationId
+        'organization_id': getattr(req, 'organizationId', None)
     }
-    
-    background_tasks.add_task(run_analysis_job, job_id, req.dict())
-    
+    background_tasks.add_task(run_pipeline_job, job_id, req.dict())
     return {
-        "runId": job_id,
-        "organizationId": req.organizationId,
-        "state": "QUEUED",
-        "message": "Analysis pipeline started successfully"
+        "run_id": job_id,
+        "useRegulation": False
     }
 
 @app.get(
@@ -812,89 +914,152 @@ async def start_pipeline(req: PipelineRequest, background_tasks: BackgroundTasks
     tags=["Requirements Analysis"],
     summary="Get Analysis Pipeline Status",
     description="Check the status and retrieve results of an asynchronous analysis job",
-    responses={
-        200: {
-            "description": "Pipeline status retrieved successfully",
-            "content": {
-                "application/json": {
-                    "examples": {
-                        "running": {
-                            "summary": "Job in progress",
-                            "value": {
-                                "runId": "550e8400-e29b-41d4-a716-446655440000",
-                                "organizationId": "atoms-tech",
-                                "state": "RUNNING",
-                                "started_at": "2025-07-30T23:46:19.318168"
-                            }
-                        },
-                        "completed": {
-                            "summary": "Job completed",
-                            "value": {
-                                "runId": "550e8400-e29b-41d4-a716-446655440000",
-                                "organizationId": "atoms-tech",
-                                "state": "DONE",
-                                "started_at": "2025-07-30T23:46:19.318168",
-                                "completed_at": "2025-07-30T23:47:25.123456",
-                                "result": {
-                                    "status": "success",
-                                    "analysisJson": "...",
-                                    "analysisJson2": "...",
-                                    "analysisJson3": "..."
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        404: {"description": "Job not found"},
-        500: {"description": "Internal Server Error"}
-    }
 )
 async def get_pipeline_status(runId: str, organizationId: str = None):
-    """
-    **Get Analysis Pipeline Status**
-    
-    Retrieves the current status and results of an asynchronous analysis job.
-    
-    **Parameters:**
-    - `runId`: Unique job identifier from the POST /api/ai response
-    - `organizationId`: Optional organization ID for additional verification
-    
-    **Job States:**
-    - `QUEUED`: Job is waiting to be processed
-    - `RUNNING`: Job is currently being processed
-    - `DONE`: Job completed successfully with results available
-    - `FAILED`: Job failed with error details available
-    
-    **Polling:**
-    - Check status periodically until state is DONE or FAILED
-    - Typical processing time: 30-60 seconds per requirement
-    - Results are cached for 24 hours after completion
-    
-    **Returns:**
-    - Current job state and timestamps
-    - Complete analysis results when DONE
-    - Error details when FAILED
-    """
     if runId not in job_storage:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
+        raise HTTPException(status_code=404, detail=json.dumps({"error": "Job not found"}))
     job = job_storage[runId]
-    response = {
-        "runId": runId,
-        "organizationId": organizationId or job.get('organization_id', 'default'),
+    response: Dict[str, Any] = {
+        "run_id": runId,
         "state": job['state'],
-        "started_at": job.get('started_at'),
-        "completed_at": job.get('completed_at')
+        "credit_cost": 0,
     }
-    
     if job['state'] == 'DONE':
-        response['result'] = job.get('result')
+        result = job.get('result', {})
+        # If text-to-mermaid stub present
+        outputs = result.get("outputs")
+        if outputs and "output" in outputs:
+            response["outputs"] = outputs
+        else:
+            response["outputs"] = _build_legacy_outputs(result)
     elif job['state'] == 'FAILED':
         response['error'] = job.get('error')
-    
     return response
+
+# --- Upload compatibility route ---
+
+@app.post(
+    "/api/upload",
+    tags=["Document Management (Compatibility)"],
+    summary="Upload Documents (Compatibility)",
+    description="Accepts multipart/form-data with 'files' only. Optional organizationId can be passed as a form field; if omitted, uses a default bucket.",
+)
+async def upload_files_compat(files: List[UploadFile] = File(...), organizationId: str = Form(None)):
+    org = organizationId or "default"
+    uploaded_files = []
+    for file in files:
+        if not (file.filename.lower().endswith('.pdf') or file.filename.lower().endswith('.md')):
+            raise HTTPException(status_code=400, detail=json.dumps({"error": f"Invalid file type: {file.filename}"}))
+        content = await file.read()
+        # store as-is; content type pdf or markdown
+        final_filename = await upload_file_to_organization_bucket(content, file.filename, org)
+        uploaded_files.append(final_filename)
+    return {"success": True, "files": uploaded_files}
+
+# --- New Requirements Endpoints ---
+
+@app.post(
+    "/api/requirements",
+    tags=["Requirements"],
+    summary="Create requirement (sync analysis and persist)",
+)
+async def create_requirement(payload: Dict[str, Any]):
+    try:
+        organization_id = payload.get("organizationId")
+        if not organization_id:
+            raise HTTPException(status_code=400, detail=json.dumps({"error": "organizationId is required"}))
+        original_requirement = payload.get("original_requirement", "")
+        system_name = payload.get("systemName", "")
+        objective = payload.get("objective", "")
+        regulation_document_name = payload.get("regulation_document_name", "")
+        temperature = float(payload.get("temperature", 0.1))
+
+        # Generate new req_id
+        bucket = create_bucket_if_not_exists(get_organization_bucket_name(organization_id))
+        req_id = _next_req_id(bucket)
+
+        # Persist input if text provided
+        if original_requirement:
+            await _persist_input_json(organization_id, req_id, {
+                "organizationId": organization_id,
+                "req_id": req_id,
+                "original_requirement": original_requirement,
+                "system_name": system_name,
+                "objective": objective,
+                "regulation_document_name": regulation_document_name,
+                "created_at": datetime.now().isoformat(),
+                "input_source": "text"
+            })
+
+        # Run analysis synchronously (similar to sync endpoint)
+        analysis_json = await analyze_requirement_step1(original_requirement, system_name, objective, req_id, temperature)
+        if regulation_document_name:
+            try:
+                regulation_text = await get_regulation_document(regulation_document_name, organization_id)
+                analysis_json2 = await analyze_regulation_step2(analysis_json, regulation_text, regulation_document_name, temperature)
+            except FileNotFoundError:
+                analysis_json2 = {
+                    "regulation_document": regulation_document_name,
+                    "relevant_passages": [],
+                    "compliance_concerns": ["No regulation document found for analysis"],
+                    "regulatory_keywords": [],
+                    "analysis_timestamp": datetime.now().isoformat()
+                }
+        else:
+            analysis_json2 = {
+                "regulation_document": "",
+                "relevant_passages": [],
+                "compliance_concerns": [],
+                "regulatory_keywords": [],
+                "analysis_timestamp": datetime.now().isoformat()
+            }
+        analysis_json3 = await analyze_compliance_step3(analysis_json, analysis_json2, temperature)
+
+        record = {
+            "req_id": req_id,
+            "organizationId": organization_id,
+            "final_requirement_ears": analysis_json3.get("final_requirement_ears", ""),
+            "final_requirement_incose": analysis_json3.get("final_requirement_incose", ""),
+            "compliance_status": analysis_json3.get("compliance_status", ""),
+            "final_quality_rating": analysis_json3.get("final_quality_rating", ""),
+            "enhancement_summary": analysis_json3.get("enhancement_summary", ""),
+            "created_at": datetime.now().isoformat(),
+            "input_source": "text" if original_requirement else "pdf",
+            "document_name": regulation_document_name or None
+        }
+        await _persist_requirement_json(organization_id, req_id, record)
+        return record
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create requirement failed: {e}")
+        raise HTTPException(status_code=500, detail=json.dumps({"error": "Failed to create requirement"}))
+
+@app.get(
+    "/api/requirements",
+    tags=["Requirements"],
+    summary="List requirements",
+)
+async def list_requirements(organizationId: str = Query(...), page: int = Query(1, ge=1), pageSize: int = Query(20, ge=1, le=100)):
+    try:
+        return await _list_requirements(organizationId, page, pageSize)
+    except Exception as e:
+        logger.error(f"List requirements failed: {e}")
+        raise HTTPException(status_code=500, detail=json.dumps({"error": "Failed to list requirements"}))
+
+@app.get(
+    "/api/requirements/{reqId}",
+    tags=["Requirements"],
+    summary="Get requirement",
+)
+async def get_requirement(reqId: str = FPath(...), organizationId: str = Query(...)):
+    try:
+        return await _get_requirement_json(organizationId, reqId)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=json.dumps({"error": "Requirement not found"}))
+    except Exception as e:
+        logger.error(f"Get requirement failed: {e}")
+        raise HTTPException(status_code=500, detail=json.dumps({"error": "Failed to get requirement"}))
 
 if __name__ == "__main__":
     import uvicorn

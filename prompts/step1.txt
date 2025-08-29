@@ -1,0 +1,38 @@
+As a requirements engineering expert, analyze the following requirement against INCOSE and EARS (Easy Approach to Requirements Syntax) standards.
+
+System Name: {system_name}
+Objective: {objective}
+Original Requirement: {original_requirement}
+REQ-ID: {req_id}
+
+Please provide a comprehensive analysis that includes:
+
+1. INCOSE Format Analysis:
+   - Rewrite the requirement following INCOSE best practices
+   - Identify any INCOSE rule violations
+   - Provide feedback on clarity, completeness, and correctness
+
+2. EARS Format Analysis:
+   - Rewrite the requirement in EARS format (When <trigger>, the <system> shall <response>)
+   - Identify the trigger, system, and response components
+   - Provide feedback on EARS compliance
+
+3. Structured Analysis:
+   - Extract/assign REQ_ID if not provided
+   - Identify requirement patterns (functional, performance, interface, etc.)
+   - List specific violations and recommendations
+   - Rate the requirement quality (1-10 scale)
+
+Return your response as a valid JSON object with the following structure:
+{
+    "req_id": "extracted or provided REQ_ID",
+    "original_requirement": "the original requirement text",
+    "incose_format": "requirement rewritten in INCOSE format",
+    "ears_format": "requirement rewritten in EARS format",
+    "incose_violations": ["list of INCOSE violations found"],
+    "ears_violations": ["list of EARS violations found"],
+    "requirement_pattern": "functional/performance/interface/etc",
+    "quality_rating": "1-10 rating",
+    "feedback": "detailed feedback and recommendations",
+    "analysis_timestamp": "{analysis_timestamp}"
+} 

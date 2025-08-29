@@ -1,0 +1,29 @@
+As a regulatory compliance expert, analyze the following requirement against the provided regulation document.
+
+Requirement Analysis from Step 1:
+{requirement_analysis_json}
+
+Regulation Document: {regulation_doc_name}
+Regulation Text: {regulation_text}
+
+Tasks:
+1. Search through the regulation text for passages relevant to this requirement
+2. Identify specific regulatory clauses, sections, or standards that apply
+3. Extract relevant regulatory text that could impact the requirement
+4. Assess potential compliance issues or conflicts
+
+Return your response as a valid JSON object with the following structure:
+{
+    "regulation_document": "{regulation_doc_name}",
+    "relevant_passages": [
+        {
+            "section": "section/clause identifier",
+            "text": "relevant regulatory text",
+            "relevance_score": "1-10 how relevant this passage is",
+            "impact": "description of how this impacts the requirement"
+        }
+    ],
+    "compliance_concerns": ["list of potential compliance issues"],
+    "regulatory_keywords": ["key terms found in regulation relevant to requirement"],
+    "analysis_timestamp": "{analysis_timestamp}"
+} 

@@ -1,20 +1,20 @@
 steps:
-  # Build the container image
+  # Build the container image (Artifact Registry)
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'gcr.io/$PROJECT_ID/requirement-refiner:$BUILD_ID', '.']
+    args: ['build', '-t', 'us-central1-docker.pkg.dev/$PROJECT_ID/atoms-api/atoms-api:$BUILD_ID', '.']
   
-  # Push the container image to Container Registry
+  # Push the container image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/requirement-refiner:$BUILD_ID']
+    args: ['push', 'us-central1-docker.pkg.dev/$PROJECT_ID/atoms-api/atoms-api:$BUILD_ID']
   
   # Deploy container image to Cloud Run
   - name: 'gcr.io/cloud-builders/gcloud'
     args:
       - 'run'
       - 'deploy'
-      - 'requirement-refiner-api'
+      - 'atoms-api'
       - '--image'
-      - 'gcr.io/$PROJECT_ID/requirement-refiner:$BUILD_ID'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/atoms-api/atoms-api:$BUILD_ID'
       - '--region'
       - 'us-central1'
       - '--platform'
@@ -30,10 +30,13 @@ steps:
       - '10'
       - '--min-instances'
       - '0'
+      # CORS and other env can be set here or via manual deploy
+      # - '--set-env-vars'
+      # - 'ALLOWED_ORIGINS=http://localhost:3000,https://atoms.tech'
 
-# Store images in Google Container Registry
+# Store images in Artifact Registry
 images:
-  - 'gcr.io/$PROJECT_ID/requirement-refiner:$BUILD_ID'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/atoms-api/atoms-api:$BUILD_ID'
 
 # Build options
 options:
