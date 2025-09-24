@@ -6,7 +6,12 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, F
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any
 import google.generativeai as genai
-from google.cloud import storage
+try:
+    from google.cloud import storage  # type: ignore
+    HAS_GCS = True
+except Exception:
+    storage = None  # type: ignore
+    HAS_GCS = False
 import PyPDF2
 from io import BytesIO
 import traceback
@@ -14,9 +19,11 @@ import uuid
 from werkzeug.utils import secure_filename
 import re
 from pathlib import Path
+from adk_app.agent import refine_requirement as agent_refine, save_requirement_supabase as agent_save
+from pydantic import BaseModel, Field, ConfigDict
 
 # Import Pydantic models
-from models import AnalysisRequest, PipelineStartParams, AnalysisResult
+from models import AnalysisRequest, PipelineStartParams, AnalysisResult, RequirementCreateRequest, RequirementRecord, RequirementListResponse
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -73,11 +80,16 @@ app.add_middleware(
 if os.getenv('GEMINI_API_KEY'):
     genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
-# Initialize Google Cloud Storage client
-storage_client = storage.Client()
+# Initialize Google Cloud Storage client (optional)
+storage_client = storage.Client() if HAS_GCS else None
 
 # In-memory job storage (in production, use Redis or database)
 job_storage: Dict[str, Dict[str, Any]] = {}
+
+# In-memory fallback stores for requirements when GCS is unavailable
+INMEM_LAST_ID: Dict[str, int] = {}
+INMEM_INPUTS: Dict[str, Dict[str, Any]] = {}
+INMEM_REQUIREMENTS: Dict[str, Dict[str, Any]] = {}
 
 # --- Helper Functions ---
 
@@ -99,20 +111,24 @@ def get_organization_bucket_name(organization_id: str) -> str:
     """Get bucket name for organization."""
     return f"{organization_id}-requirements"
 
-def create_bucket_if_not_exists(bucket_name: str) -> storage.Bucket:
-    """Create bucket if it doesn't exist."""
+def create_bucket_if_not_exists(bucket_name: str):
+    """Create bucket if it doesn't exist (requires GCS)."""
+    if not HAS_GCS:
+        raise HTTPException(status_code=501, detail="GCS not configured")
     try:
-        bucket = storage_client.bucket(bucket_name)
+        bucket = storage_client.bucket(bucket_name)  # type: ignore[arg-type]
         if not bucket.exists():
-            bucket = storage_client.create_bucket(bucket_name, location="US")
+            bucket = storage_client.create_bucket(bucket_name, location="US")  # type: ignore
             logger.info(f"Created bucket: {bucket_name}")
         return bucket
     except Exception as e:
         logger.error(f"Error creating bucket {bucket_name}: {str(e)}")
         raise
 
-def get_versioned_filename(bucket: storage.Bucket, base_filename: str) -> str:
+def get_versioned_filename(bucket, base_filename: str) -> str:
     """Get a versioned filename if the base filename already exists."""
+    if not HAS_GCS:
+        return base_filename
     name, ext = os.path.splitext(base_filename)
     blob = bucket.blob(base_filename)
     if not blob.exists():
@@ -120,17 +136,29 @@ def get_versioned_filename(bucket: storage.Bucket, base_filename: str) -> str:
     
     counter = 1
     while True:
-        versioned_name = f"{name}({counter}){ext}"
-        blob = bucket.blob(versioned_name)
-        if not blob.exists():
-            return versioned_name
+        candidate = f"{name}_{counter}{ext}"
+        if not bucket.blob(candidate).exists():
+            return candidate
         counter += 1
+
+def _next_req_id_inmem(org_id: str) -> str:
+    last = INMEM_LAST_ID.get(org_id, 0) + 1
+    INMEM_LAST_ID[org_id] = last
+    return f"{last:04d}"
+
+def next_req_id(organization_id: str) -> str:
+    if HAS_GCS:
+        bucket = create_bucket_if_not_exists(get_organization_bucket_name(organization_id))
+        return _next_req_id(bucket)
+    return _next_req_id_inmem(organization_id)
 
 async def list_organization_documents(organization_id: str) -> List[Dict[str, Any]]:
     """List all documents in an organization's bucket."""
     try:
         bucket_name = get_organization_bucket_name(organization_id)
-        bucket = storage_client.bucket(bucket_name)
+        if not HAS_GCS:
+            raise HTTPException(status_code=501, detail="GCS not configured")
+        bucket = storage_client.bucket(bucket_name)  # type: ignore
         
         if not bucket.exists():
             return []
@@ -152,7 +180,9 @@ async def delete_organization_document(organization_id: str, document_name: str)
     """Delete a document from an organization's bucket."""
     try:
         bucket_name = get_organization_bucket_name(organization_id)
-        bucket = storage_client.bucket(bucket_name)
+        if not HAS_GCS:
+            raise HTTPException(status_code=501, detail="GCS not configured")
+        bucket = storage_client.bucket(bucket_name)  # type: ignore
         
         if not bucket.exists():
             raise FileNotFoundError(f"Organization bucket not found: {bucket_name}")
@@ -184,9 +214,11 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
 
 async def get_regulation_document(document_name: str, organization_id: str) -> str:
     """Download and extract text from regulation document in organization's bucket."""
+    if not HAS_GCS:
+        raise FileNotFoundError("GCS not configured")
     try:
         bucket_name = get_organization_bucket_name(organization_id)
-        bucket = storage_client.bucket(bucket_name)
+        bucket = storage_client.bucket(bucket_name)  # type: ignore
         
         if not bucket.exists():
             raise FileNotFoundError(f"Organization bucket not found: {bucket_name}")
@@ -210,6 +242,8 @@ async def get_regulation_document(document_name: str, organization_id: str) -> s
 
 async def upload_file_to_organization_bucket(file_content: bytes, filename: str, organization_id: str) -> str:
     """Upload file to organization's Cloud Storage bucket."""
+    if not HAS_GCS:
+        raise HTTPException(status_code=501, detail="GCS upload not available")
     try:
         bucket_name = get_organization_bucket_name(organization_id)
         bucket = create_bucket_if_not_exists(bucket_name)
@@ -349,10 +383,10 @@ def _requirements_prefix() -> str:
 def _inputs_prefix() -> str:
     return "inputs"
 
-def _index_blob(bucket: storage.Bucket) -> storage.Blob:
+def _index_blob(bucket) -> Any:
     return bucket.blob(f"{_requirements_prefix()}/index.json")
 
-def _load_index(bucket: storage.Bucket) -> Dict[str, Any]:
+def _load_index(bucket) -> Dict[str, Any]:
     blob = _index_blob(bucket)
     if not blob.exists():
         return {"last_id": 0}
@@ -362,7 +396,7 @@ def _load_index(bucket: storage.Bucket) -> Dict[str, Any]:
     except Exception:
         return {"last_id": 0}
 
-def _save_index_with_cas(bucket: storage.Bucket, new_index: Dict[str, Any], expected_generation: int) -> bool:
+def _save_index_with_cas(bucket, new_index: Dict[str, Any], expected_generation: int) -> bool:
     blob = _index_blob(bucket)
     data = json.dumps(new_index).encode("utf-8")
     try:
@@ -372,7 +406,7 @@ def _save_index_with_cas(bucket: storage.Bucket, new_index: Dict[str, Any], expe
         logger.warning(f"Index CAS write failed: {e}")
         return False
 
-def _next_req_id(bucket: storage.Bucket) -> str:
+def _next_req_id(bucket) -> str:
     # CAS loop to increment last_id
     blob = _index_blob(bucket)
     while True:
@@ -387,36 +421,51 @@ def _next_req_id(bucket: storage.Bucket) -> str:
             return f"{next_id:04d}"
 
 async def _persist_input_json(organization_id: str, req_id: str, payload: Dict[str, Any]):
-    bucket = create_bucket_if_not_exists(get_organization_bucket_name(organization_id))
-    blob = bucket.blob(f"{_inputs_prefix()}/{req_id}.json")
-    blob.upload_from_string(json.dumps(payload), content_type="application/json")
+    if HAS_GCS:
+        bucket = create_bucket_if_not_exists(get_organization_bucket_name(organization_id))
+        blob = bucket.blob(f"{_inputs_prefix()}/{req_id}.json")
+        blob.upload_from_string(json.dumps(payload), content_type="application/json")
+        return
+    # in-memory fallback
+    INMEM_INPUTS[f"{organization_id}:{req_id}"] = payload
 
 async def _persist_requirement_json(organization_id: str, req_id: str, record: Dict[str, Any]):
-    bucket = create_bucket_if_not_exists(get_organization_bucket_name(organization_id))
-    blob = bucket.blob(f"{_requirements_prefix()}/{req_id}.json")
-    blob.upload_from_string(json.dumps(record), content_type="application/json")
+    if HAS_GCS:
+        bucket = create_bucket_if_not_exists(get_organization_bucket_name(organization_id))
+        blob = bucket.blob(f"{_requirements_prefix()}/{req_id}.json")
+        blob.upload_from_string(json.dumps(record), content_type="application/json")
+        return
+    INMEM_REQUIREMENTS[f"{organization_id}:{req_id}"] = record
 
 async def _get_requirement_json(organization_id: str, req_id: str) -> Dict[str, Any]:
-    bucket = storage_client.bucket(get_organization_bucket_name(organization_id))
-    blob = bucket.blob(f"{_requirements_prefix()}/{req_id}.json")
-    if not blob.exists():
+    if HAS_GCS:
+        bucket = storage_client.bucket(get_organization_bucket_name(organization_id))  # type: ignore
+        blob = bucket.blob(f"{_requirements_prefix()}/{req_id}.json")
+        if not blob.exists():
+            raise FileNotFoundError("Requirement not found")
+        return json.loads(blob.download_as_text())
+    key = f"{organization_id}:{req_id}"
+    if key not in INMEM_REQUIREMENTS:
         raise FileNotFoundError("Requirement not found")
-    return json.loads(blob.download_as_text())
+    return INMEM_REQUIREMENTS[key]
 
 async def _list_requirements(organization_id: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-    bucket = storage_client.bucket(get_organization_bucket_name(organization_id))
-    if not bucket.exists():
-        return {"items": [], "total": 0, "page": page, "pageSize": page_size}
-    prefix = f"{_requirements_prefix()}/"
-    blobs = list(bucket.list_blobs(prefix=prefix))
-    items = []
-    for b in blobs:
-        if not b.name.endswith(".json") or b.name.endswith("index.json"):
-            continue
-        try:
-            items.append(json.loads(b.download_as_text()))
-        except Exception:
-            continue
+    if HAS_GCS:
+        bucket = storage_client.bucket(get_organization_bucket_name(organization_id))  # type: ignore
+        if not bucket.exists():
+            return {"items": [], "total": 0, "page": page, "pageSize": page_size}
+        prefix = f"{_requirements_prefix()}/"
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        items = []
+        for b in blobs:
+            if not b.name.endswith(".json") or b.name.endswith("index.json"):
+                continue
+            try:
+                items.append(json.loads(b.download_as_text()))
+            except Exception:
+                continue
+    else:
+        items = [v for k, v in INMEM_REQUIREMENTS.items() if k.startswith(f"{organization_id}:")]
     items.sort(key=lambda r: r.get("req_id", ""))
     total = len(items)
     start = max((page - 1) * page_size, 0)
@@ -962,21 +1011,44 @@ async def upload_files_compat(files: List[UploadFile] = File(...), organizationI
     "/api/requirements",
     tags=["Requirements"],
     summary="Create requirement (sync analysis and persist)",
+    response_model=RequirementRecord,
+    responses={
+        200: {
+            "description": "Requirement created",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "req_id": "0001",
+                                "organizationId": "atoms-tech",
+                        "final_requirement_ears": "When a valid user input...",
+                        "final_requirement_incose": "The system shall respond...",
+                        "compliance_status": "COMPLIANT",
+                        "final_quality_rating": "9",
+                        "enhancement_summary": "Specified timing and method",
+                        "created_at": "2025-08-29T18:00:00.000Z",
+                        "input_source": "text",
+                        "document_name": None
+                    }
+                }
+            }
+        },
+        400: {"description": "Bad Request"},
+        500: {"description": "Server Error"}
+    }
 )
-async def create_requirement(payload: Dict[str, Any]):
+async def create_requirement(payload: RequirementCreateRequest) -> RequirementRecord:
     try:
-        organization_id = payload.get("organizationId")
+        organization_id = payload.organizationId
         if not organization_id:
             raise HTTPException(status_code=400, detail=json.dumps({"error": "organizationId is required"}))
-        original_requirement = payload.get("original_requirement", "")
-        system_name = payload.get("systemName", "")
-        objective = payload.get("objective", "")
-        regulation_document_name = payload.get("regulation_document_name", "")
-        temperature = float(payload.get("temperature", 0.1))
+        original_requirement = payload.original_requirement or ""
+        system_name = payload.systemName or ""
+        objective = payload.objective or ""
+        regulation_document_name = payload.regulation_document_name or ""
+        temperature = float(payload.temperature or 0.1)
 
         # Generate new req_id
-        bucket = create_bucket_if_not_exists(get_organization_bucket_name(organization_id))
-        req_id = _next_req_id(bucket)
+        req_id = next_req_id(organization_id)
 
         # Persist input if text provided
         if original_requirement:
@@ -991,7 +1063,7 @@ async def create_requirement(payload: Dict[str, Any]):
                 "input_source": "text"
             })
 
-        # Run analysis synchronously (similar to sync endpoint)
+        # Run analysis synchronously
         analysis_json = await analyze_requirement_step1(original_requirement, system_name, objective, req_id, temperature)
         if regulation_document_name:
             try:
@@ -1015,19 +1087,96 @@ async def create_requirement(payload: Dict[str, Any]):
             }
         analysis_json3 = await analyze_compliance_step3(analysis_json, analysis_json2, temperature)
 
-        record = {
-            "req_id": req_id,
-            "organizationId": organization_id,
-            "final_requirement_ears": analysis_json3.get("final_requirement_ears", ""),
-            "final_requirement_incose": analysis_json3.get("final_requirement_incose", ""),
-            "compliance_status": analysis_json3.get("compliance_status", ""),
-            "final_quality_rating": analysis_json3.get("final_quality_rating", ""),
-            "enhancement_summary": analysis_json3.get("enhancement_summary", ""),
-            "created_at": datetime.now().isoformat(),
-            "input_source": "text" if original_requirement else "pdf",
-            "document_name": regulation_document_name or None
-        }
-        await _persist_requirement_json(organization_id, req_id, record)
+        record: RequirementRecord = RequirementRecord(
+            req_id=req_id,
+            organizationId=organization_id,
+            final_requirement_ears=analysis_json3.get("final_requirement_ears", ""),
+            final_requirement_incose=analysis_json3.get("final_requirement_incose", ""),
+            compliance_status=analysis_json3.get("compliance_status", ""),
+            final_quality_rating=str(analysis_json3.get("final_quality_rating", "")),
+            enhancement_summary=analysis_json3.get("enhancement_summary", ""),
+            created_at=datetime.now().isoformat(),
+            input_source="text" if original_requirement else "pdf",
+            document_name=regulation_document_name or None
+        )
+        await _persist_requirement_json(organization_id, req_id, record.model_dump())
+        return record
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create requirement failed: {e}")
+        raise HTTPException(status_code=500, detail=json.dumps({"error": "Failed to create requirement"}))
+
+@app.post(
+    "/api/requirements",
+    tags=["Requirements"],
+    summary="Create requirement",
+    response_model=RequirementRecord,
+)
+async def create_requirement(payload: RequirementCreateRequest) -> RequirementRecord:
+    try:
+        organization_id = payload.organizationId
+        if not organization_id:
+            raise HTTPException(status_code=400, detail=json.dumps({"error": "organizationId is required"}))
+        original_requirement = payload.original_requirement or ""
+        system_name = payload.systemName or ""
+        objective = payload.objective or ""
+        regulation_document_name = payload.regulation_document_name or ""
+        temperature = float(payload.temperature or 0.1)
+
+        # Generate new req_id
+        req_id = next_req_id(organization_id)
+
+        # Persist input if text provided
+        if original_requirement:
+            await _persist_input_json(organization_id, req_id, {
+                "organizationId": organization_id,
+                "req_id": req_id,
+                "original_requirement": original_requirement,
+                "system_name": system_name,
+                "objective": objective,
+                "regulation_document_name": regulation_document_name,
+                "created_at": datetime.now().isoformat(),
+                "input_source": "text"
+            })
+
+        # Run analysis synchronously
+        analysis_json = await analyze_requirement_step1(original_requirement, system_name, objective, req_id, temperature)
+        if regulation_document_name:
+            try:
+                regulation_text = await get_regulation_document(regulation_document_name, organization_id)
+                analysis_json2 = await analyze_regulation_step2(analysis_json, regulation_text, regulation_document_name, temperature)
+            except FileNotFoundError:
+                analysis_json2 = {
+                    "regulation_document": regulation_document_name,
+                    "relevant_passages": [],
+                    "compliance_concerns": ["No regulation document found for analysis"],
+                    "regulatory_keywords": [],
+                    "analysis_timestamp": datetime.now().isoformat()
+                }
+        else:
+            analysis_json2 = {
+                "regulation_document": "",
+                "relevant_passages": [],
+                "compliance_concerns": [],
+                "regulatory_keywords": [],
+                "analysis_timestamp": datetime.now().isoformat()
+            }
+        analysis_json3 = await analyze_compliance_step3(analysis_json, analysis_json2, temperature)
+
+        record: RequirementRecord = RequirementRecord(
+            req_id=req_id,
+            organizationId=organization_id,
+            final_requirement_ears=analysis_json3.get("final_requirement_ears", ""),
+            final_requirement_incose=analysis_json3.get("final_requirement_incose", ""),
+            compliance_status=analysis_json3.get("compliance_status", ""),
+            final_quality_rating=str(analysis_json3.get("final_quality_rating", "")),
+            enhancement_summary=analysis_json3.get("enhancement_summary", ""),
+            created_at=datetime.now().isoformat(),
+            input_source="text" if original_requirement else "pdf",
+            document_name=regulation_document_name or None
+        )
+        await _persist_requirement_json(organization_id, req_id, record.model_dump())
         return record
     except HTTPException:
         raise
@@ -1039,10 +1188,12 @@ async def create_requirement(payload: Dict[str, Any]):
     "/api/requirements",
     tags=["Requirements"],
     summary="List requirements",
+    response_model=RequirementListResponse,
 )
-async def list_requirements(organizationId: str = Query(...), page: int = Query(1, ge=1), pageSize: int = Query(20, ge=1, le=100)):
+async def list_requirements(organizationId: str = Query(..., examples=["atoms-tech"]), page: int = Query(1, ge=1), pageSize: int = Query(20, ge=1, le=100)) -> RequirementListResponse:
     try:
-        return await _list_requirements(organizationId, page, pageSize)
+        data = await _list_requirements(organizationId, page, pageSize)
+        return RequirementListResponse(**data)
     except Exception as e:
         logger.error(f"List requirements failed: {e}")
         raise HTTPException(status_code=500, detail=json.dumps({"error": "Failed to list requirements"}))
@@ -1051,15 +1202,118 @@ async def list_requirements(organizationId: str = Query(...), page: int = Query(
     "/api/requirements/{reqId}",
     tags=["Requirements"],
     summary="Get requirement",
+    response_model=RequirementRecord,
 )
-async def get_requirement(reqId: str = FPath(...), organizationId: str = Query(...)):
+async def get_requirement(reqId: str = FPath(..., examples=["0001"]), organizationId: str = Query(..., examples=["atoms-tech"])) -> RequirementRecord:
     try:
-        return await _get_requirement_json(organizationId, reqId)
+        data = await _get_requirement_json(organizationId, reqId)
+        return RequirementRecord(**data)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=json.dumps({"error": "Requirement not found"}))
     except Exception as e:
         logger.error(f"Get requirement failed: {e}")
         raise HTTPException(status_code=500, detail=json.dumps({"error": "Failed to get requirement"}))
+
+class RefineBody(BaseModel):
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "pipelineType": "requirement-analysis",
+            "requirement": "The system shall respond within 2 seconds",
+            "systemName": "Web",
+            "objective": "Performance"
+        }
+    })
+    userId: str | None = None
+    pipelineType: str | None = Field(default="requirement-analysis")
+    requirement: str
+    file_urls: List[str] | None = None
+    systemName: str | None = None
+    objective: str | None = None
+    temperature: float | None = None
+
+class RefineAndSaveBody(RefineBody):
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "pipelineType": "requirement-analysis",
+            "requirement": "The system shall respond within 2 seconds",
+            "systemName": "Web",
+            "objective": "Performance",
+            "document_id": "0885a911-26dc-4623-9b27-dcdcb624da8f",
+            "block_id": "88f46695-ae65-4d93-98c2-88dabba2c94b",
+            "name": "Login responds within 2s",
+            "original_requirement": "The system shall respond within 2 seconds",
+            "tags": ["performance"]
+        }
+    })
+    document_id: str
+    block_id: str
+    name: str
+    original_requirement: str | None = None
+    description: str | None = None
+    created_by: str | None = None
+    tags: List[str] | None = None
+
+@app.post("/v1/agent/refine", tags=["Agent"], summary="Refine requirement (proxy)")
+async def proxy_refine(body: RefineBody):
+    try:
+        r = agent_refine(
+            requirement=body.requirement,
+            systemName=body.systemName or "",
+            objective=body.objective or "",
+            file_urls=body.file_urls or None,
+        )
+        # Present as DONE payload for FE parity
+        return {
+            "run_id": r.get("run_id"),
+            "state": "DONE",
+            "outputs": r.get("outputs", {}),
+            "credit_cost": 0,
+        }
+    except ValueError as e:
+        logger.error(f"proxy_refine_validation_failed: {e}")
+        raise HTTPException(status_code=400, detail=json.dumps({"error": "VALIDATION_ERROR", "message": str(e)}))
+    except Exception as e:
+        logger.error(f"proxy_refine_failed: {e}")
+        raise HTTPException(status_code=500, detail=json.dumps({"error": "MODEL_ERROR"}))
+
+@app.post("/v1/agent/refine-and-save", tags=["Agent"], summary="Refine and save to Supabase (proxy)")
+async def proxy_refine_and_save(body: RefineAndSaveBody):
+    try:
+        r = agent_refine(
+            requirement=body.requirement,
+            systemName=body.systemName or "",
+            objective=body.objective or "",
+            file_urls=body.file_urls or None,
+        )
+        saved = agent_save(
+            document_id=body.document_id,
+            block_id=body.block_id,
+            name=body.name,
+            final_requirement_incose=r["analysisJson3"].get("final_requirement_incose", ""),
+            final_requirement_ears=r["analysisJson3"].get("final_requirement_ears", ""),
+            compliance_status=r["analysisJson3"].get("compliance_status", ""),
+            final_quality_rating=r["analysisJson3"].get("final_quality_rating", None),
+            regulatory_traceability=r["analysisJson2"].get("relevant_passages", []),
+            original_requirement=body.original_requirement,
+            description=body.description,
+            created_by=body.created_by,
+            tags=body.tags or [],
+        )
+        return {
+            "run_id": r.get("run_id"),
+            "state": "DONE",
+            "outputs": r.get("outputs", {}),
+            "save": saved,
+            "credit_cost": 0,
+        }
+    except ValueError as e:
+        logger.error(f"proxy_refine_and_save_validation_failed: {e}")
+        raise HTTPException(status_code=400, detail=json.dumps({"error": "VALIDATION_ERROR", "message": str(e)}))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"proxy_refine_and_save_failed: {e}")
+        raise HTTPException(status_code=500, detail=json.dumps({"error": "MODEL_OR_DB_ERROR"}))
 
 if __name__ == "__main__":
     import uvicorn

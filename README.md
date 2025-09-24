@@ -11,7 +11,7 @@ Gumloop-compatible backend with org-scoped storage and prompts-driven analysis. 
 ## Quickstart (curl)
 
 - Health
-```bash
+   ```bash
 curl -s https://<SERVICE_URL>/health
 ```
 
@@ -22,7 +22,7 @@ curl -s -X POST https://<SERVICE_URL>/api/ai \
   -d '{
     "pipelineType": "requirement-analysis",
     "requirement": "The system shall respond within 2 seconds",
-    "temperature": 0.1
+  "temperature": 0.1
   }'
 ```
 

@@ -1,0 +1,16 @@
+fastapi==0.115.6
+uvicorn[standard]==0.22.0
+python-multipart==0.0.9
+google-generativeai==0.8.3
+# Storage libs excluded; persistence via Supabase
+python-dotenv==1.0.0
+PyYAML==6.0.2
+pydantic>=2.7,<3
+werkzeug==3.0.1
+requests==2.32.5
+pypdf==4.3.1
+PyPDF2==3.0.1
+# For calling the agent tools from API
+google-cloud-aiplatform>=1.115.0
+google-genai>=1.21.1
+# ADK removed from API container; guarded imports in code 

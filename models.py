@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Union, Literal
+from typing import List, Optional, Union, Literal, Dict, Any
 
 class AnalysisRequest(BaseModel):
     original_requirement: str
@@ -15,16 +15,15 @@ class PipelineInput(BaseModel):
     value: str
 
 class PipelineStartParams(BaseModel):
-    pipelineType: Optional[Literal['file-processing','requirement-analysis','requirement-analysis-reasoning','text-to-mermaid']] = None
-    requirement: Optional[str] = None
+    pipelineType: Optional[Literal['file-processing','requirement-analysis','requirement-analysis-reasoning','text-to-mermaid']] = Field(default=None, examples=["requirement-analysis"])
+    requirement: Optional[str] = Field(default=None, examples=["The system shall ..."])
     fileNames: Optional[List[str]] = None
     systemName: Optional[str] = None
     objective: Optional[str] = None
     model_preference: Optional[str] = None
-    temperature: Optional[float] = Field(default=0.1, ge=0.0, le=1.0)
+    temperature: Optional[float] = Field(default=0.1, ge=0.0, le=1.0, examples=[0.1])
     customPipelineInputs: Optional[List[PipelineInput]] = None
     savedItemId: Optional[str] = None
-    # Optional organizationId for internal mapping; not required by frontend today
     organizationId: Optional[str] = None
 
 class Step1Analysis(BaseModel):
@@ -80,3 +79,31 @@ class AnalysisResult(BaseModel):
     analysisJson2: Step2Analysis
     analysisJson3: Step3Analysis
     processed_timestamp: str
+
+# --- Requirements API Schemas ---
+
+class RequirementCreateRequest(BaseModel):
+    organizationId: str = Field(examples=["atoms-tech"])
+    original_requirement: Optional[str] = Field(default=None, examples=["The system shall respond within 2 seconds"])
+    systemName: Optional[str] = Field(default=None, examples=["Web App"])
+    objective: Optional[str] = Field(default=None, examples=["Performance"])
+    regulation_document_name: Optional[str] = Field(default=None, examples=["ISO-26262.pdf"])
+    temperature: Optional[float] = Field(default=0.1, ge=0.0, le=1.0)
+
+class RequirementRecord(BaseModel):
+    req_id: str = Field(examples=["0001"])
+    organizationId: str = Field(examples=["atoms-tech"])
+    final_requirement_ears: str
+    final_requirement_incose: str
+    compliance_status: str
+    final_quality_rating: Union[str, int]
+    enhancement_summary: str
+    created_at: str
+    input_source: Literal['text','pdf']
+    document_name: Optional[str] = None
+
+class RequirementListResponse(BaseModel):
+    items: List[RequirementRecord]
+    total: int
+    page: int
+    pageSize: int

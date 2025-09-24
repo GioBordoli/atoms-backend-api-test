@@ -1,0 +1,5 @@
+google-adk>=1.1.0
+google-cloud-aiplatform[adk,agent_engines]>=1.88.0
+# Optional: when running agent locally for tests
+python-dotenv==1.0.0
+requests==2.32.5 
